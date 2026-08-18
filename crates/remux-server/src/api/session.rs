@@ -23,7 +23,7 @@ use crate::{
     db,
     db::auth,
     playback::session::TranscodeSession,
-    services::{self, MediaResolveService},
+    services::{self, MediaResolveService, StreamService},
 };
 
 pub(crate) async fn abandon_playback_startup(
@@ -164,7 +164,7 @@ pub async fn report_playback_start(
     session: auth::AuthSession,
     Json(data): Json<api::PlaybackInfo>,
 ) -> Result<impl IntoResponse> {
-    state
+    let stopped_sessions = state
         .ctx
         .sessions
         .start(
@@ -185,6 +185,19 @@ pub async fn report_playback_start(
                 e.context_internal("failed to start session")
             }
         })?;
+    for play_session_id in stopped_sessions {
+        abandon_playback_startup(
+            &state,
+            &play_session_id,
+            "replaced by another video on the same device",
+        )
+        .await;
+        state
+            .ctx
+            .torrent
+            .release_playback(&play_session_id)
+            .await;
+    }
     let _ = state
         .ctx
         .ws_tx
@@ -248,6 +261,15 @@ pub async fn report_playback_progress(
             )
             .await
             .context_internal("failed to update progress")?;
+        if data
+            .position_ticks
+            .is_some_and(|position| position > 0)
+        {
+            state
+                .ctx
+                .torrent
+                .mark_playback_watched(psid);
+        }
         let _ = state
             .ctx
             .ws_tx
@@ -327,6 +349,26 @@ pub async fn report_playback_stopped(
             )
             .await
             .context_internal("failed to record stop")?;
+        if data
+            .position_ticks
+            .is_some_and(|position| position > 0)
+        {
+            state
+                .ctx
+                .torrent
+                .mark_playback_watched(psid);
+        }
+        state
+            .ctx
+            .torrent
+            .release_playback(psid)
+            .await;
+        StreamService::clear_auto_session_winner(
+            &state
+                .ctx
+                .store,
+            psid,
+        );
         let _ = state
             .ctx
             .ws_tx
@@ -1377,6 +1419,17 @@ pub async fn delete_transcoding(
             .sessions
             .stop_transcode(&play_session_id)
             .await;
+        state
+            .ctx
+            .torrent
+            .release_playback(&play_session_id)
+            .await;
+        StreamService::clear_auto_session_winner(
+            &state
+                .ctx
+                .store,
+            &play_session_id,
+        );
         let _ = state
             .ctx
             .ws_tx

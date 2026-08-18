@@ -339,6 +339,7 @@ pub async fn init_app(
         );
     }
 
+    let torrent_mgr = Arc::new(torrent_mgr);
     let web_client = make_web_client(conn.clone());
 
     let addons = addons::AddonService::from_db(&conn, &config).await?;
@@ -348,7 +349,7 @@ pub async fn init_app(
         db: conn.clone(),
         store: Store::new_weighted(128 * 1024 * 1024),
         sessions: playback_session::PlaybackSessionManager::new(transcode_sessions_dir),
-        torrent: Arc::new(torrent_mgr),
+        torrent: torrent_mgr,
         ws_tx: tokio::sync::broadcast::channel(128).0,
         default_web_client: Arc::new(tokio::sync::RwLock::new(
             web_client::normalize_web_client(saved_config.default_web_client)
@@ -372,6 +373,8 @@ pub async fn init_app(
         .spawn_cleanup_task(
             std::time::Duration::from_secs(60),
             std::time::Duration::from_secs(60 * 15),
+            ctx.torrent
+                .clone(),
         );
 
     db::StreamGroup::migrate_from_settings(&conn).await;
@@ -384,6 +387,42 @@ pub async fn init_app(
     task_service
         .run_startup_tasks()
         .await?;
+
+    // Automatic disk storage strategy. Active ownership comes from live playback
+    // sessions/HTTP streams; recency comes from the exact source last watched.
+    {
+        let ctx_clone = ctx.clone();
+        tokio::spawn(async move {
+            // Let persisted torrents finish restoring before the first pass,
+            // then enforce the same policy periodically.
+            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+            loop {
+                let max_gb = ctx_clone
+                    .config
+                    .torrent_max_storage_gb;
+                let keep_days = ctx_clone
+                    .config
+                    .torrent_keep_days;
+                let min_free = ctx_clone
+                    .config
+                    .torrent_min_free_gb;
+                let keep_count = ctx_clone
+                    .config
+                    .torrent_keep_count;
+                let _ = ctx_clone
+                    .torrent
+                    .enforce_watched_storage_limits(
+                        &ctx_clone.db,
+                        max_gb,
+                        keep_days,
+                        min_free,
+                        keep_count,
+                    )
+                    .await;
+                tokio::time::sleep(std::time::Duration::from_secs(900)).await;
+            }
+        });
+    }
 
     let state = AppState {
         ctx: ctx.clone(),
@@ -521,6 +560,22 @@ pub struct Config {
     /// (not 0) or many trackers will reject the announce.
     #[serde(default = "default_torrent_peer_port")]
     pub torrent_peer_port: Option<u16>,
+    /// Maximum allocated torrent storage in GB. When exceeded, the oldest
+    /// inactive torrents are removed; torrents owned by playback are preserved.
+    #[serde(default = "default_torrent_max_storage_gb")]
+    pub torrent_max_storage_gb: Option<u64>,
+    /// Days to retain an inactive torrent after confirmed playback progress.
+    /// A download that was never watched has no recency protection.
+    #[serde(default = "default_torrent_keep_days")]
+    pub torrent_keep_days: Option<u32>,
+    /// Minimum free disk space in GB. Oldest inactive torrents are removed when
+    /// available space falls below this threshold.
+    #[serde(default = "default_torrent_min_free_gb")]
+    pub torrent_min_free_gb: Option<u64>,
+    /// Number of recently watched inactive torrents to retain. Never-watched
+    /// downloads do not consume a retention slot; active torrents are exempt.
+    #[serde(default = "default_torrent_keep_count")]
+    pub torrent_keep_count: Option<usize>,
     /// Path to the bgutil-pot binary used by yt-dlp for YouTube POT token generation.
     #[serde(default = "default_bgutil_script_path")]
     pub bgutil_script_path: std::path::PathBuf,
@@ -620,6 +675,22 @@ fn default_torrent_peer_port() -> Option<u16> {
     Some(6881)
 }
 
+fn default_torrent_max_storage_gb() -> Option<u64> {
+    Some(50)
+}
+
+fn default_torrent_keep_days() -> Option<u32> {
+    Some(2)
+}
+
+fn default_torrent_min_free_gb() -> Option<u64> {
+    Some(10)
+}
+
+fn default_torrent_keep_count() -> Option<usize> {
+    Some(3)
+}
+
 impl Config {
     /// Fill in `None` fields that derive from `data_dir`. Call once after loading.
     pub fn resolve(mut self) -> Self {
@@ -660,6 +731,10 @@ impl Default for Config {
             slow_query_threshold_ms: default_slow_query_threshold_ms(),
             disable_dht: false,
             torrent_peer_port: default_torrent_peer_port(),
+            torrent_max_storage_gb: default_torrent_max_storage_gb(),
+            torrent_keep_days: default_torrent_keep_days(),
+            torrent_min_free_gb: default_torrent_min_free_gb(),
+            torrent_keep_count: default_torrent_keep_count(),
             bgutil_script_path: default_bgutil_script_path(),
             tmdb_base_url: default_tmdb_base_url(),
             trakt_base_url: default_trakt_base_url(),

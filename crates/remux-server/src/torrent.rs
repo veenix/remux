@@ -40,6 +40,15 @@ pub(crate) struct TorrentPreflight {
     pub managed: Option<ManagedTorrentAvailability>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct TorrentSidecarSubtitle {
+    pub file_idx: usize,
+    pub path: String,
+    pub language: Option<String>,
+    pub is_forced: bool,
+    pub is_hearing_impaired: bool,
+}
+
 #[derive(Clone, Debug)]
 struct CachedTorrentFile {
     name: String,
@@ -56,6 +65,7 @@ struct CachedTorrentMetadata {
 
 struct TorrentActivity {
     session: Arc<Session>,
+    lifecycle_lock: tokio::sync::Mutex<()>,
     active_requests: DashMap<usize, usize>,
     playback_torrents: DashMap<String, usize>,
     last_watched: DashMap<usize, NaiveDateTime>,
@@ -88,6 +98,13 @@ impl TorrentActivity {
     }
 
     async fn pause_if_idle(self: Arc<Self>, torrent_id: usize) {
+        // Serialize the final idle check with new claims. Without this lock, a
+        // completed hedge probe can decide to pause just before the winning
+        // playback registers ownership, interrupting its live FileStream.
+        let _lifecycle_guard = self
+            .lifecycle_lock
+            .lock()
+            .await;
         if self.is_active(torrent_id) {
             return;
         }
@@ -104,6 +121,37 @@ impl TorrentActivity {
             debug!(torrent_id, %error, "torrent was already stopped or removed");
         } else {
             debug!(torrent_id, "paused torrent with no active playback");
+        }
+    }
+
+    async fn pause_if_no_playback(self: Arc<Self>, torrent_id: usize) {
+        // An explicit playback release is authoritative. A disconnected HLS,
+        // probe, or subtitle request can outlive the player briefly, but it
+        // must not keep downloading after the last viewer has stopped.
+        let _lifecycle_guard = self
+            .lifecycle_lock
+            .lock()
+            .await;
+        if self
+            .playback_torrents
+            .iter()
+            .any(|entry| *entry.value() == torrent_id)
+        {
+            return;
+        }
+        let api = Api::new(
+            self.session
+                .clone(),
+            None,
+            None,
+        );
+        if let Err(error) = api
+            .api_torrent_action_pause(TorrentIdOrHash::Id(torrent_id))
+            .await
+        {
+            debug!(torrent_id, %error, "torrent was already stopped or removed");
+        } else {
+            debug!(torrent_id, "paused torrent with no playback owner");
         }
     }
 }
@@ -203,6 +251,7 @@ impl TorrentManager {
 
         let activity = Arc::new(TorrentActivity {
             session: session.clone(),
+            lifecycle_lock: tokio::sync::Mutex::new(()),
             active_requests: DashMap::new(),
             playback_torrents: DashMap::new(),
             last_watched: DashMap::new(),
@@ -250,11 +299,10 @@ impl TorrentManager {
                     .into_iter()
                     .filter_map(|torrent| torrent.id)
                 {
-                    if !reconcile_activity.is_active(torrent_id) {
-                        let _ = api
-                            .api_torrent_action_pause(TorrentIdOrHash::Id(torrent_id))
-                            .await;
-                    }
+                    reconcile_activity
+                        .clone()
+                        .pause_if_idle(torrent_id)
+                        .await;
                 }
             }
         });
@@ -271,6 +319,36 @@ impl TorrentManager {
             activity,
             cleanup_lock: tokio::sync::Mutex::new(()),
         })
+    }
+
+    /// Return text subtitle files associated with the selected video in a
+    /// torrent whose metadata has already been fetched. This never starts a
+    /// download; bytes are requested only if the client selects a subtitle.
+    pub(crate) fn subtitle_sidecars(
+        &self,
+        descriptor: &crate::stream::StreamDescriptor,
+    ) -> Vec<TorrentSidecarSubtitle> {
+        let crate::stream::StreamDescriptor::Torrent {
+            info_hash,
+            file_hint,
+            file_idx,
+            ..
+        } = descriptor
+        else {
+            return Vec::new();
+        };
+        let Some(metadata) = self
+            .preflight_cache
+            .get(&info_hash.to_ascii_lowercase())
+        else {
+            return Vec::new();
+        };
+        let Ok(selected_idx) =
+            select_file_index(&metadata.files, *file_idx, file_hint.as_deref())
+        else {
+            return Vec::new();
+        };
+        select_sidecar_subtitles(&metadata.files, selected_idx)
     }
 
     /// Gracefully shut down the librqbit session, releasing all sockets
@@ -297,13 +375,14 @@ impl TorrentManager {
         };
         self.activity
             .clone()
-            .pause_if_idle(torrent_id)
+            .pause_if_no_playback(torrent_id)
             .await;
         Some(torrent_id)
     }
 
     /// Release playback ownership. The torrent is paused as soon as the last
-    /// playback session and the last in-flight HTTP request are gone.
+    /// playback session is gone, even if an abandoned HTTP request is still
+    /// winding down.
     pub async fn release_playback(&self, play_session_id: &str) {
         let _ = self
             .release_playback_torrent(play_session_id)
@@ -360,31 +439,10 @@ impl TorrentManager {
         &self,
         play_session_id: &str,
     ) -> Option<usize> {
-        let (_, torrent_id) = self
-            .activity
-            .playback_torrents
-            .remove(play_session_id)?;
-        let shared_by_other_playback = self
-            .activity
-            .playback_torrents
-            .iter()
-            .any(|entry| *entry.value() == torrent_id);
-        if !shared_by_other_playback {
-            let api = Api::new(
-                self.session
-                    .clone(),
-                None,
-                None,
-            );
-            if let Err(error) = api
-                .api_torrent_action_pause(TorrentIdOrHash::Id(torrent_id))
-                .await
-            {
-                debug!(torrent_id, %error, "failed to pause rejected playback torrent");
-            } else {
-                info!(torrent_id, %play_session_id, "paused rejected playback torrent for source switch");
-            }
-        }
+        let torrent_id = self
+            .release_playback_torrent(play_session_id)
+            .await?;
+        info!(torrent_id, %play_session_id, "released rejected playback torrent for source switch");
         Some(torrent_id)
     }
 
@@ -532,50 +590,51 @@ impl TorrentManager {
         Ok(true)
     }
 
-    async fn acquire_stream(
+    async fn claim_stream(
         &self,
         torrent_id: usize,
         playback_ids: &[String],
     ) -> TorrentStreamGuard {
-        self.activity
-            .active_requests
-            .entry(torrent_id)
-            .and_modify(|count| *count += 1)
-            .or_insert(1);
-        // Construct the guard before the first await. Cancelling a startup
-        // request must release the request count instead of leaving a torrent
-        // permanently marked active.
-        let guard = TorrentStreamGuard {
-            activity: self
+        let (guard, replaced) = {
+            let _lifecycle_guard = self
                 .activity
-                .clone(),
-            torrent_id,
-        };
+                .lifecycle_lock
+                .lock()
+                .await;
+            self.activity
+                .active_requests
+                .entry(torrent_id)
+                .and_modify(|count| *count += 1)
+                .or_insert(1);
+            // Construct the guard before leaving the critical section. Any
+            // later cancellation releases the request count.
+            let guard = TorrentStreamGuard {
+                activity: self
+                    .activity
+                    .clone(),
+                torrent_id,
+            };
 
-        let mut replaced = Vec::new();
-        for play_session_id in playback_ids {
-            if let Some(old_id) = self
-                .activity
-                .playback_torrents
-                .insert(play_session_id.clone(), torrent_id)
-            {
-                if old_id != torrent_id {
-                    replaced.push(old_id);
+            let mut replaced = Vec::new();
+            for play_session_id in playback_ids {
+                if let Some(old_id) = self
+                    .activity
+                    .playback_torrents
+                    .insert(play_session_id.clone(), torrent_id)
+                {
+                    if old_id != torrent_id {
+                        replaced.push(old_id);
+                    }
                 }
             }
-        }
+            (guard, replaced)
+        };
         let api = Api::new(
             self.session
                 .clone(),
             None,
             None,
         );
-        if let Err(error) = api
-            .api_torrent_action_start(TorrentIdOrHash::Id(torrent_id))
-            .await
-        {
-            debug!(torrent_id, %error, "torrent was already running");
-        }
 
         // A new playback owns the bandwidth. Keep genuinely concurrent
         // playback sessions running, but pause every unowned/background torrent.
@@ -952,13 +1011,35 @@ impl TorrentManager {
         // Own the torrent before waiting for metadata. If the client goes away
         // during magnet resolution, the guard pauses the empty torrent.
         let guard = self
-            .acquire_stream(torrent_id, playback_ids)
+            .claim_stream(torrent_id, playback_ids)
             .await;
 
         tokio::time::timeout(Duration::from_secs(30), handle.wait_until_initialized())
             .await
             .context("timed out waiting for torrent metadata")?
             .context("torrent initialization failed")?;
+
+        let api = Api::new(
+            self.session
+                .clone(),
+            None,
+            None,
+        );
+        // Persisted torrents may come from an older build that selected every
+        // file in a bundle. Clear that natural queue before starting playback;
+        // the HTTP FileStream below is the sole owner of requested pieces.
+        api.api_torrent_action_update_only_files(
+            TorrentIdOrHash::Id(torrent_id),
+            &HashSet::new(),
+        )
+        .await
+        .context("failed to put torrent in stream-only mode")?;
+        if let Err(error) = api
+            .api_torrent_action_start(TorrentIdOrHash::Id(torrent_id))
+            .await
+        {
+            debug!(torrent_id, %error, "torrent was already running");
+        }
 
         let files = handle.with_metadata(|metadata| {
             metadata
@@ -979,12 +1060,6 @@ impl TorrentManager {
             .get(file_idx)
             .context("selected torrent file disappeared")?;
 
-        let api = Api::new(
-            self.session
-                .clone(),
-            None,
-            None,
-        );
         // The torrent was added with `only_files = []`. Do not temporarily
         // select the movie here: rqbit eagerly queues the entire selected file,
         // and clearing the selection afterward does not reliably cancel those
@@ -1087,6 +1162,308 @@ impl TorrentManager {
             .ok()
     }
 
+    /// List all managed torrent descriptors.
+    pub fn list_torrents(&self) -> Vec<librqbit::api::TorrentDetailsResponse> {
+        let api = librqbit::api::Api::new(
+            self.session
+                .clone(),
+            None,
+            None,
+        );
+        api.api_torrent_list()
+            .torrents
+    }
+
+    /// Return live stats for a torrent, if it exists.
+    pub fn stats(&self, id: usize) -> Option<librqbit::api::TorrentStats> {
+        let api = librqbit::api::Api::new(
+            self.session
+                .clone(),
+            None,
+            None,
+        );
+        api.api_stats_v1(librqbit::api::TorrentIdOrHash::Id(id))
+            .ok()
+    }
+
+    /// Enforce storage policy using actual playback recency. A torrent is
+    /// "active" only while a playback session/request owns it, and "recent"
+    /// only when that exact stream source was watched. Download timestamps and
+    /// sparse-file logical lengths are deliberately not used.
+    pub async fn enforce_watched_storage_limits(
+        &self,
+        db: &sqlx::SqlitePool,
+        max_storage_gb: Option<u64>,
+        keep_days: Option<u32>,
+        min_free_gb: Option<u64>,
+        keep_count: Option<usize>,
+    ) -> Result<usize> {
+        let _cleanup_guard = self
+            .cleanup_lock
+            .lock()
+            .await;
+        let api = Api::new(
+            self.session
+                .clone(),
+            None,
+            None,
+        );
+        let active = self
+            .activity
+            .active_ids();
+
+        // user_media_state.stream_id is the exact source selected for playback.
+        // Joining by parent item would incorrectly mark every candidate for the
+        // same movie as recently watched.
+        let watched_rows = sqlx::query_as::<_, (String, Option<NaiveDateTime>)>(
+            "SELECT lower(json_extract(s.stream_info, '$.descriptor.Torrent.info_hash')), \
+                    max(coalesce(u.last_played_at, u.played_at)) \
+             FROM media s \
+             JOIN user_media_state u ON u.stream_id = s.id \
+             WHERE json_extract(s.stream_info, '$.descriptor.Torrent.info_hash') IS NOT NULL \
+             GROUP BY lower(json_extract(s.stream_info, '$.descriptor.Torrent.info_hash'))",
+        )
+        .fetch_all(db)
+        .await
+        .unwrap_or_else(|error| {
+            warn!(%error, "failed to load torrent watch history");
+            Vec::new()
+        });
+        let watched_by_hash: HashMap<String, NaiveDateTime> = watched_rows
+            .into_iter()
+            .filter_map(|(hash, watched)| watched.map(|watched| (hash, watched)))
+            .collect();
+
+        let details = api
+            .api_torrent_list()
+            .torrents;
+        let mut entries = Vec::new();
+        for torrent in details {
+            let Some(id) = torrent.id else {
+                continue;
+            };
+            let storage_paths =
+                torrent_storage_paths(&api, id, PathBuf::from(&torrent.output_folder));
+            let mut last_watched = watched_by_hash
+                .get(
+                    &torrent
+                        .info_hash
+                        .to_ascii_lowercase(),
+                )
+                .copied();
+            if let Some(in_memory) = self
+                .activity
+                .last_watched
+                .get(&id)
+                .map(|v| *v)
+            {
+                last_watched = Some(
+                    last_watched.map_or(in_memory, |db_time| db_time.max(in_memory)),
+                );
+            }
+            entries.push(StorageEntry {
+                id,
+                info_hash: torrent.info_hash,
+                storage_paths,
+                allocated_bytes: 0,
+                last_watched,
+            });
+        }
+
+        let paths: Vec<Vec<PathBuf>> = entries
+            .iter()
+            .map(|entry| {
+                entry
+                    .storage_paths
+                    .clone()
+            })
+            .collect();
+        let sizes = tokio::task::spawn_blocking(move || {
+            paths
+                .iter()
+                .map(|paths| {
+                    paths
+                        .iter()
+                        .map(|path| allocated_size(path))
+                        .sum()
+                })
+                .collect::<Vec<_>>()
+        })
+        .await
+        .context("torrent size scan failed")?;
+        for (entry, size) in entries
+            .iter_mut()
+            .zip(sizes)
+        {
+            entry.allocated_bytes = size;
+        }
+
+        // Oldest watched first; never-watched downloads are the first eviction
+        // candidates because they are neither active nor recent user behavior.
+        entries.sort_by_key(|entry| entry.last_watched);
+        let policy_delete = retention_delete_ids(
+            &entries,
+            &active,
+            Utc::now().naive_utc(),
+            keep_days,
+            keep_count,
+        );
+
+        let data_dir = self
+            .data_dir
+            .clone();
+        let mut total_allocated =
+            tokio::task::spawn_blocking(move || allocated_size(&data_dir))
+                .await
+                .context("torrent directory size scan failed")?;
+        let mut deleted_ids = HashSet::new();
+        let mut deleted = 0usize;
+
+        for entry in &entries {
+            if !policy_delete.contains(&entry.id)
+                || self
+                    .activity
+                    .is_active(entry.id)
+            {
+                continue;
+            }
+            match api
+                .api_torrent_action_delete(TorrentIdOrHash::Id(entry.id))
+                .await
+            {
+                Ok(_) => {
+                    deleted += 1;
+                    deleted_ids.insert(entry.id);
+                    total_allocated =
+                        total_allocated.saturating_sub(entry.allocated_bytes);
+                    self.activity
+                        .last_watched
+                        .remove(&entry.id);
+                    info!(
+                        torrent_id = entry.id,
+                        info_hash = %entry.info_hash,
+                        allocated_bytes = entry.allocated_bytes,
+                        last_watched = ?entry.last_watched,
+                        "deleted inactive torrent outside watch-retention policy"
+                    );
+                }
+                Err(error) => {
+                    warn!(torrent_id = entry.id, %error, "failed to delete torrent")
+                }
+            }
+        }
+
+        // A crash or an older build can leave files after rqbit forgets the
+        // torrent. Reclaim those before applying disk-pressure eviction so
+        // orphan bytes cannot cause a recently watched torrent to be deleted.
+        let orphan_cleanup_safe = entries
+            .iter()
+            .all(|entry| {
+                entry
+                    .storage_paths
+                    .iter()
+                    .all(|path| path != &self.data_dir)
+            });
+        if orphan_cleanup_safe {
+            let protected_roots: HashSet<PathBuf> = entries
+                .iter()
+                .filter(|entry| !deleted_ids.contains(&entry.id))
+                .flat_map(|entry| {
+                    entry
+                        .storage_paths
+                        .iter()
+                })
+                .filter_map(|path| top_level_storage_root(&self.data_dir, path))
+                .collect();
+            let data_dir = self
+                .data_dir
+                .clone();
+            let removed = tokio::task::spawn_blocking(move || {
+                remove_orphaned_storage(
+                    &data_dir,
+                    &protected_roots,
+                    Duration::from_secs(10 * 60),
+                )
+            })
+            .await
+            .context("orphaned torrent storage scan failed")?;
+            for (path, allocated_bytes) in removed {
+                total_allocated = total_allocated.saturating_sub(allocated_bytes);
+                info!(
+                    path = %path.display(),
+                    allocated_bytes,
+                    "deleted orphaned torrent storage"
+                );
+            }
+        } else {
+            debug!(
+                "skipped orphaned torrent storage scan while metadata was incomplete"
+            );
+        }
+
+        let max_bytes = max_storage_gb.map(|gb| gb.saturating_mul(1024 * 1024 * 1024));
+        let min_free_bytes =
+            min_free_gb.map(|gb| gb.saturating_mul(1024 * 1024 * 1024));
+        for entry in &entries {
+            let over_max = max_bytes.is_some_and(|max| total_allocated > max);
+            let below_free = min_free_bytes
+                .zip(free_bytes(&self.data_dir))
+                .is_some_and(|(minimum, free)| free < minimum);
+            if !over_max && !below_free {
+                break;
+            }
+            if deleted_ids.contains(&entry.id)
+                || self
+                    .activity
+                    .is_active(entry.id)
+            {
+                continue;
+            }
+            match api
+                .api_torrent_action_delete(TorrentIdOrHash::Id(entry.id))
+                .await
+            {
+                Ok(_) => {
+                    deleted += 1;
+                    deleted_ids.insert(entry.id);
+                    total_allocated =
+                        total_allocated.saturating_sub(entry.allocated_bytes);
+                    self.activity
+                        .last_watched
+                        .remove(&entry.id);
+                    warn!(
+                        torrent_id = entry.id,
+                        info_hash = %entry.info_hash,
+                        allocated_bytes = entry.allocated_bytes,
+                        last_watched = ?entry.last_watched,
+                        over_max,
+                        below_free,
+                        "deleted oldest inactive torrent for disk pressure"
+                    );
+                }
+                Err(error) => {
+                    warn!(torrent_id = entry.id, %error, "failed to delete torrent")
+                }
+            }
+        }
+
+        let still_over_max = max_bytes.is_some_and(|max| total_allocated > max);
+        let still_below_free = min_free_bytes
+            .zip(free_bytes(&self.data_dir))
+            .is_some_and(|(minimum, free)| free < minimum);
+        if still_over_max || still_below_free {
+            warn!(
+                total_allocated,
+                still_over_max,
+                still_below_free,
+                active_torrents = active.len(),
+                "torrent storage remains above limits; active torrents were preserved"
+            );
+        }
+
+        Ok(deleted)
+    }
+
     /// Apply upload/download speed limits.  0 = no limit (for download) or
     /// effectively-disabled (for upload — 1 bps is used since the API requires
     /// `NonZeroU32`).
@@ -1116,9 +1493,113 @@ impl TorrentManager {
 struct StorageEntry {
     id: usize,
     info_hash: String,
-    path: PathBuf,
+    storage_paths: Vec<PathBuf>,
     allocated_bytes: u64,
     last_watched: Option<NaiveDateTime>,
+}
+
+fn torrent_storage_paths(
+    api: &Api,
+    torrent_id: usize,
+    output_folder: PathBuf,
+) -> Vec<PathBuf> {
+    let paths = api
+        .api_torrent_details(TorrentIdOrHash::Id(torrent_id))
+        .ok()
+        .and_then(|details| details.files)
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|file| join_storage_components(&output_folder, &file.components))
+        .collect::<Vec<_>>();
+
+    if paths.is_empty() {
+        vec![output_folder]
+    } else {
+        paths
+    }
+}
+
+fn join_storage_components(
+    output_folder: &std::path::Path,
+    components: &[String],
+) -> Option<PathBuf> {
+    let mut path = output_folder.to_path_buf();
+    for component in components {
+        if component.is_empty()
+            || component == "."
+            || component == ".."
+            || component.contains('/')
+            || component.contains('\\')
+        {
+            return None;
+        }
+        path.push(component);
+    }
+    Some(path)
+}
+
+fn top_level_storage_root(
+    data_dir: &std::path::Path,
+    path: &std::path::Path,
+) -> Option<PathBuf> {
+    let relative = path
+        .strip_prefix(data_dir)
+        .ok()?;
+    let first = relative
+        .components()
+        .next()?;
+    match first {
+        std::path::Component::Normal(component) => Some(data_dir.join(component)),
+        _ => None,
+    }
+}
+
+fn remove_orphaned_storage(
+    data_dir: &std::path::Path,
+    protected_roots: &HashSet<PathBuf>,
+    minimum_age: Duration,
+) -> Vec<(PathBuf, u64)> {
+    let Ok(entries) = std::fs::read_dir(data_dir) else {
+        return Vec::new();
+    };
+    let now = std::time::SystemTime::now();
+    let mut removed = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if protected_roots.contains(&path) {
+            continue;
+        }
+        let Ok(metadata) = std::fs::symlink_metadata(&path) else {
+            continue;
+        };
+        let old_enough = metadata
+            .modified()
+            .ok()
+            .and_then(|modified| {
+                now.duration_since(modified)
+                    .ok()
+            })
+            .is_some_and(|age| age >= minimum_age);
+        if !old_enough {
+            continue;
+        }
+        let allocated_bytes = allocated_size(&path);
+        let result = if metadata
+            .file_type()
+            .is_symlink()
+            || metadata.is_file()
+        {
+            std::fs::remove_file(&path)
+        } else if metadata.is_dir() {
+            std::fs::remove_dir_all(&path)
+        } else {
+            continue;
+        };
+        if result.is_ok() {
+            removed.push((path, allocated_bytes));
+        }
+    }
+    removed
 }
 
 fn retention_delete_ids(
@@ -1294,6 +1775,130 @@ fn is_video_file(name: &str) -> bool {
         .and_then(|extension| extension.to_str())
         .unwrap_or_default();
     remux_sdks::remux::VideoContainer::parse_known(extension).is_some()
+}
+
+fn is_supported_sidecar_subtitle(name: &str) -> bool {
+    let extension = std::path::Path::new(name)
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .unwrap_or_default();
+    // The response path currently converts SubRip to Jellyfin's requested
+    // VTT/JSON formats. Do not advertise other text codecs as SubRip until
+    // their conversion is implemented.
+    extension.eq_ignore_ascii_case("srt")
+}
+
+fn subtitle_language_from_name(name: &str) -> Option<String> {
+    let stem = std::path::Path::new(name)
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .unwrap_or_default();
+    stem.split(|c: char| !c.is_ascii_alphabetic())
+        .rev()
+        .find_map(|token| {
+            remux_sdks::remux::lang_to_two_letter(&token.to_ascii_lowercase())
+        })
+}
+
+fn select_sidecar_subtitles(
+    files: &[CachedTorrentFile],
+    selected_idx: usize,
+) -> Vec<TorrentSidecarSubtitle> {
+    let Some(selected) = files.get(selected_idx) else {
+        return Vec::new();
+    };
+    let selected_name = selected
+        .name
+        .replace('\\', "/");
+    let selected_path = std::path::Path::new(&selected_name);
+    let selected_parent = selected_path
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new(""));
+    let selected_stem = selected_path
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let videos_in_parent = files
+        .iter()
+        .filter(|file| {
+            if !is_video_file(&file.name) {
+                return false;
+            }
+            let normalized = file
+                .name
+                .replace('\\', "/");
+            std::path::Path::new(&normalized)
+                .parent()
+                .unwrap_or_else(|| std::path::Path::new(""))
+                == selected_parent
+        })
+        .count();
+
+    files
+        .iter()
+        .enumerate()
+        .filter_map(|(file_idx, file)| {
+            if file.length == 0
+                || file.length > 20 * 1024 * 1024
+                || !is_supported_sidecar_subtitle(&file.name)
+            {
+                return None;
+            }
+            let normalized = file
+                .name
+                .replace('\\', "/");
+            let subtitle_path = std::path::Path::new(&normalized);
+            let subtitle_parent = subtitle_path
+                .parent()
+                .unwrap_or_else(|| std::path::Path::new(""));
+            let subtitle_stem = subtitle_path
+                .file_stem()
+                .and_then(|stem| stem.to_str())
+                .unwrap_or_default()
+                .to_ascii_lowercase();
+            let basename_matches =
+                !selected_stem.is_empty() && subtitle_stem.starts_with(&selected_stem);
+            let same_directory = subtitle_parent == selected_parent;
+            let in_subtitle_directory = subtitle_parent
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| {
+                    name.eq_ignore_ascii_case("subs")
+                        || name.eq_ignore_ascii_case("subtitles")
+                })
+                && subtitle_parent
+                    .parent()
+                    .unwrap_or_else(|| std::path::Path::new(""))
+                    == selected_parent;
+            // Generic names such as `Subs/2_English.srt` are safe only when
+            // the selected directory contains a single video. Filename-matched
+            // subtitles remain safe for episode packs and movie collections.
+            if !basename_matches
+                && !(videos_in_parent == 1 && (same_directory || in_subtitle_directory))
+            {
+                return None;
+            }
+            let lower = subtitle_stem.to_ascii_lowercase();
+            let tokens: Vec<&str> = lower
+                .split(|c: char| !c.is_ascii_alphanumeric())
+                .filter(|token| !token.is_empty())
+                .collect();
+            Some(TorrentSidecarSubtitle {
+                file_idx,
+                path: normalized.clone(),
+                language: subtitle_language_from_name(&normalized),
+                is_forced: tokens
+                    .iter()
+                    .any(|token| matches!(*token, "forced" | "foreign" | "signs")),
+                is_hearing_impaired: tokens
+                    .iter()
+                    .any(|token| {
+                        matches!(*token, "sdh" | "cc" | "hi" | "hearingimpaired")
+                    }),
+            })
+        })
+        .collect()
 }
 
 fn select_file_index(
@@ -1491,6 +2096,67 @@ mod tests {
     }
 
     #[test]
+    fn single_movie_release_exposes_generic_subtitle_directory() {
+        let files = vec![
+            file("Movie.2016.1080p.mp4", 2_000),
+            file("Subs/2_English.srt", 20),
+            file("Subs/3_English.srt", 25),
+            file("Subs/4_English.ass", 30),
+            file("RARBG.txt", 1),
+        ];
+
+        let subtitles = select_sidecar_subtitles(&files, 0);
+        assert_eq!(subtitles.len(), 2);
+        assert_eq!(subtitles[0].file_idx, 1);
+        assert_eq!(
+            subtitles[0]
+                .language
+                .as_deref(),
+            Some("en")
+        );
+        assert_eq!(subtitles[1].file_idx, 2);
+        assert_eq!(
+            subtitles[1]
+                .language
+                .as_deref(),
+            Some("en")
+        );
+    }
+
+    #[test]
+    fn movie_bundle_does_not_attach_ambiguous_generic_subtitles() {
+        let files = vec![
+            file("Movie.One.1080p.mkv", 2_000),
+            file("Movie.Two.1080p.mkv", 2_100),
+            file("Subs/2_English.srt", 20),
+        ];
+
+        assert!(select_sidecar_subtitles(&files, 0).is_empty());
+        assert!(select_sidecar_subtitles(&files, 1).is_empty());
+    }
+
+    #[test]
+    fn episode_pack_exposes_only_filename_matched_sidecar() {
+        let files = vec![
+            file("Show.S01E01.mkv", 1_000),
+            file("Show.S01E01.en.forced.srt", 10),
+            file("Show.S01E02.mkv", 1_000),
+            file("Show.S01E02.en.srt", 10),
+        ];
+
+        let subtitles = select_sidecar_subtitles(&files, 0);
+        assert_eq!(subtitles.len(), 1);
+        assert_eq!(subtitles[0].file_idx, 1);
+        assert_eq!(
+            subtitles[0]
+                .language
+                .as_deref(),
+            Some("en")
+        );
+        assert!(subtitles[0].is_forced);
+    }
+
+    #[test]
     fn no_file_selection_means_stream_only_not_all_files() {
         let options = add_options(None, None, None);
         assert_eq!(options.only_files, Some(Vec::new()));
@@ -1513,7 +2179,7 @@ mod tests {
         let entry = |id, age_hours: Option<i64>| StorageEntry {
             id,
             info_hash: id.to_string(),
-            path: PathBuf::new(),
+            storage_paths: Vec::new(),
             allocated_bytes: 0,
             last_watched: age_hours.map(|hours| now - chrono::Duration::hours(hours)),
         };
@@ -1534,5 +2200,44 @@ mod tests {
             retention_delete_ids(&entries, &active, now, None, Some(1)),
             HashSet::from([3, 4, 5])
         );
+    }
+
+    #[test]
+    fn torrent_storage_paths_reject_parent_traversal() {
+        let root = std::path::Path::new("/torrent-data/release");
+        assert_eq!(
+            join_storage_components(root, &["Subs".into(), "English.srt".into()]),
+            Some(root.join("Subs/English.srt"))
+        );
+        assert_eq!(
+            join_storage_components(root, &["..".into(), "outside".into()]),
+            None
+        );
+    }
+
+    #[test]
+    fn orphan_cleanup_preserves_managed_top_level_paths() {
+        let temp = tempfile::tempdir().unwrap();
+        let managed = temp
+            .path()
+            .join("managed");
+        let orphan = temp
+            .path()
+            .join("orphan");
+        std::fs::create_dir_all(&managed).unwrap();
+        std::fs::create_dir_all(&orphan).unwrap();
+        std::fs::write(managed.join("movie.mkv"), b"managed").unwrap();
+        std::fs::write(orphan.join("movie.mkv"), b"orphan").unwrap();
+
+        let removed = remove_orphaned_storage(
+            temp.path(),
+            &HashSet::from([managed.clone()]),
+            Duration::ZERO,
+        );
+
+        assert!(managed.exists());
+        assert!(!orphan.exists());
+        assert_eq!(removed.len(), 1);
+        assert_eq!(removed[0].0, orphan);
     }
 }

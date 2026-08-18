@@ -189,6 +189,14 @@ impl PlaybackSessionManager {
             );
     }
 
+    /// Whether PlaybackInfo created an in-progress startup for this ID. This
+    /// exists before clients can send PlaybackStart, while HLS may already be
+    /// resolving and buffering its selected source.
+    pub fn has_startup(&self, play_session_id: &str) -> bool {
+        self.startups
+            .contains_key(play_session_id)
+    }
+
     fn mark_startup<F>(&self, play_session_id: &str, update: F)
     where
         F: FnOnce(&mut PlaybackStartup, Duration),
@@ -718,6 +726,27 @@ impl PlaybackSessionManager {
         let position_ticks = data
             .position_ticks
             .unwrap_or(ps.position_ticks);
+        let selected_stream_id = if let Some(transcode) = ps
+            .transcode
+            .as_ref()
+        {
+            Some(
+                transcode
+                    .read()
+                    .await
+                    .media_source_id,
+            )
+        } else {
+            data.media_source_id
+                .as_deref()
+                .or(ps
+                    .media_source_id
+                    .as_deref())
+                .and_then(|id| {
+                    id.parse::<Uuid>()
+                        .ok()
+                })
+        };
         if let Ok(Some(media)) = db::Media::get_by_id(db, &item_id).await {
             let cfg = user
                 .configuration
@@ -747,6 +776,7 @@ impl PlaybackSessionManager {
                 user,
                 &media,
                 position_ticks,
+                selected_stream_id,
                 audio_idx,
                 subtitle_idx,
                 media.runtime,
@@ -787,6 +817,36 @@ impl PlaybackSessionManager {
                 ps.as_ref()
                     .map(|s| s.position_ticks)
             });
+        let selected_stream_id = if let Some(session) = ps.as_ref() {
+            if let Some(transcode) = session
+                .transcode
+                .as_ref()
+            {
+                Some(
+                    transcode
+                        .read()
+                        .await
+                        .media_source_id,
+                )
+            } else {
+                data.media_source_id
+                    .as_deref()
+                    .or(session
+                        .media_source_id
+                        .as_deref())
+                    .and_then(|id| {
+                        id.parse::<Uuid>()
+                            .ok()
+                    })
+            }
+        } else {
+            data.media_source_id
+                .as_deref()
+                .and_then(|id| {
+                    id.parse::<Uuid>()
+                        .ok()
+                })
+        };
 
         let mut played = false;
         if let Some(item_id) = item_id {
@@ -796,6 +856,7 @@ impl PlaybackSessionManager {
                     user,
                     &media,
                     final_ticks.unwrap_or(0),
+                    selected_stream_id,
                     None, // don't overwrite stream selections on stop
                     None,
                     media.runtime, // Some(runtime) triggers watched-threshold check
@@ -924,6 +985,40 @@ impl PlaybackSessionManager {
             if direct_match || transcode_match {
                 ids.push(session.play_session_id);
             }
+        }
+        ids
+    }
+
+    /// Resolve the playback owners for a concrete stream request. PlaybackInfo
+    /// creates a startup before clients can send PlaybackStart, so a requested
+    /// ID is valid when either phase currently knows about it.
+    pub async fn playback_ids_for_stream(
+        &self,
+        source_id: Uuid,
+        requested_play_session_id: Option<&str>,
+    ) -> Vec<String> {
+        let mut ids = self
+            .playback_ids_for_media_source(source_id)
+            .await;
+        let Some(play_session_id) = requested_play_session_id else {
+            return ids;
+        };
+        let session_exists = self
+            .get(play_session_id)
+            .is_some();
+        if !session_exists && !self.has_startup(play_session_id) {
+            return ids;
+        }
+        if session_exists {
+            self.update(play_session_id, |session| {
+                session.media_source_id = Some(source_id.to_string());
+            });
+        }
+        if !ids
+            .iter()
+            .any(|id| id == play_session_id)
+        {
+            ids.push(play_session_id.to_string());
         }
         ids
     }
@@ -1171,6 +1266,7 @@ impl PlaybackSessionManager {
         self,
         interval: Duration,
         max_age: Duration,
+        torrent: Arc<crate::torrent::TorrentManager>,
     ) -> JoinHandle<()> {
         tokio::spawn(async move {
             let mut ticker = tokio::time::interval(interval);
@@ -1196,6 +1292,9 @@ impl PlaybackSessionManager {
                 for id in stale {
                     info!("Cleaning up idle session: {}", id);
                     self.stop(&id)
+                        .await;
+                    torrent
+                        .release_playback(&id)
                         .await;
                 }
             }
@@ -1229,6 +1328,40 @@ async fn kill_transcode(ts: Arc<tokio::sync::RwLock<TranscodeSession>>) {
 #[cfg(test)]
 mod startup_metric_tests {
     use super::*;
+
+    #[tokio::test]
+    async fn startup_can_own_a_stream_until_it_reaches_a_terminal_outcome() {
+        let temp = tempfile::tempdir().unwrap();
+        let manager = PlaybackSessionManager::new(temp.path());
+        let play_session_id = "ownership-test";
+        let source_id = Uuid::new_v4();
+
+        manager.begin_startup(
+            play_session_id,
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            "device",
+            "client",
+        );
+        assert!(manager.has_startup(play_session_id));
+        assert_eq!(
+            manager
+                .playback_ids_for_stream(source_id, Some(play_session_id))
+                .await,
+            vec![play_session_id.to_string()]
+        );
+
+        manager
+            .fail_startup(play_session_id, "test complete")
+            .unwrap();
+        assert!(!manager.has_startup(play_session_id));
+        assert!(
+            manager
+                .playback_ids_for_stream(source_id, Some(play_session_id))
+                .await
+                .is_empty()
+        );
+    }
 
     #[test]
     fn progress_backdates_actual_playback_but_not_before_first_segment() {

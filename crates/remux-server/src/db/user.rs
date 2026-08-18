@@ -648,6 +648,7 @@ impl UserMediaState {
         user: &User,
         media: &super::Media,
         position_ticks: i64,
+        stream_id: Option<Uuid>,
         audio_idx: Option<i64>,
         subtitle_idx: Option<i64>,
         runtime_seconds: Option<i64>,
@@ -655,6 +656,10 @@ impl UserMediaState {
         let mut ms = Self::get_or_new(db, user, media).await?;
         let position_seconds = position_ticks / 10_000_000;
         ms.playback_position = position_seconds;
+
+        if let Some(stream_id) = stream_id {
+            ms.stream_id = Some(stream_id);
+        }
 
         if let Some(idx) = audio_idx {
             ms.audio_idx = Some(idx);
@@ -1176,6 +1181,7 @@ mod playback_threshold_tests {
             ticks(secs),
             None,
             None,
+            None,
             media.runtime,
         )
         .await
@@ -1235,6 +1241,7 @@ mod playback_threshold_tests {
             &user,
             &media,
             ticks(RUNTIME * 99 / 100),
+            None,
             None,
             None,
             None,

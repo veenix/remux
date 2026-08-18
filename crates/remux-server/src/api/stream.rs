@@ -1,5 +1,5 @@
 use axum::{
-    extract::{Path, State},
+    extract::{Path, Query, State},
     response::IntoResponse,
 };
 use remux_macros::get;
@@ -23,6 +23,7 @@ pub async fn stream_proxy(
     headers: axum::http::HeaderMap,
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
+    Query(query): Query<crate::api::VideoStreamQuery>,
 ) -> Result<impl IntoResponse> {
     let media = db::Media::get_by_id(
         &state
@@ -80,7 +81,12 @@ pub async fn stream_proxy(
         let playback_ids = state
             .ctx
             .sessions
-            .playback_ids_for_media_source(id)
+            .playback_ids_for_stream(
+                id,
+                query
+                    .play_session_id
+                    .as_deref(),
+            )
             .await;
         return TorrentSource {
             info_hash: info_hash.clone(),

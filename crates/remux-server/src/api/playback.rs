@@ -1304,12 +1304,7 @@ async fn videos_stream_inner(
                     "P2P streams are disabled by the server administrator",
                 );
             }
-            let mut playback_ids = state
-                .ctx
-                .sessions
-                .playback_ids_for_media_source(media.id)
-                .await;
-            if let Some(play_session_id) = q
+            let requested_play_session_id = q
                 .play_session_id
                 .clone()
                 .or_else(|| {
@@ -1322,29 +1317,12 @@ async fn videos_stream_inner(
                                 .get_by_device(device_id)
                                 .map(|session| session.play_session_id)
                         })
-                })
-            {
-                if state
-                    .ctx
-                    .sessions
-                    .get(&play_session_id)
-                    .is_some()
-                {
-                    state
-                        .ctx
-                        .sessions
-                        .update(&play_session_id, |session| {
-                            session.media_source_id = Some(
-                                media
-                                    .id
-                                    .to_string(),
-                            );
-                        });
-                    if !playback_ids.contains(&play_session_id) {
-                        playback_ids.push(play_session_id);
-                    }
-                }
-            }
+                });
+            let playback_ids = state
+                .ctx
+                .sessions
+                .playback_ids_for_stream(media.id, requested_play_session_id.as_deref())
+                .await;
             crate::stream::TorrentSource {
                 info_hash: info_hash.clone(),
                 file_hint: file_hint

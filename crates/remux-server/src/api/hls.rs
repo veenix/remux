@@ -361,6 +361,57 @@ fn can_prebuffer_probe(result: &StartupProbeResult) -> bool {
         && AutoPrebufferPlan::from_probe(result).is_some()
 }
 
+fn auto_prebuffer_url(port: u16, media_id: Uuid, play_session_id: &str) -> String {
+    format!(
+        "http://127.0.0.1:{port}/stream/{media_id}?PlaySessionId={}",
+        urlencoding::encode(play_session_id)
+    )
+}
+
+struct AutoPrebufferOwnership {
+    torrent: Arc<crate::torrent::TorrentManager>,
+    play_session_id: String,
+    handed_off: bool,
+}
+
+impl AutoPrebufferOwnership {
+    fn new(state: &AppState, play_session_id: &str) -> Self {
+        Self {
+            torrent: state
+                .ctx
+                .torrent
+                .clone(),
+            play_session_id: play_session_id.to_string(),
+            handed_off: false,
+        }
+    }
+
+    fn hand_off(&mut self) {
+        self.handed_off = true;
+    }
+}
+
+impl Drop for AutoPrebufferOwnership {
+    fn drop(&mut self) {
+        if self.handed_off {
+            return;
+        }
+        let torrent = self
+            .torrent
+            .clone();
+        let play_session_id = self
+            .play_session_id
+            .clone();
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            runtime.spawn(async move {
+                torrent
+                    .release_playback(&play_session_id)
+                    .await;
+            });
+        }
+    }
+}
+
 async fn prebuffer_auto_source(
     state: &AppState,
     play_session_id: &str,
@@ -372,13 +423,16 @@ async fn prebuffer_auto_source(
         "Auto prebuffer source changed unexpectedly"
     );
 
-    let url = format!(
-        "http://127.0.0.1:{}/stream/{}",
+    // Use the playback-aware stream endpoint so the prebuffer owns this
+    // torrent for the user's session. Otherwise cleanup can treat the source
+    // as idle and delete it while the user is still waiting for playback.
+    let url = auto_prebuffer_url(
         state
             .ctx
             .config
             .port,
-        media.id
+        media.id,
+        play_session_id,
     );
     let mut next_offset = plan
         .next_offset
@@ -397,6 +451,10 @@ async fn prebuffer_auto_source(
         required_mbps = plan.required_bitrate_bps / 1_000_000.0,
         "Auto source needs prebuffering before playback"
     );
+    // The playback-aware endpoint claims the torrent during this request. If
+    // prebuffering fails or is cancelled, release that provisional claim. On
+    // success, transfer it to the HLS input request that follows immediately.
+    let mut ownership = AutoPrebufferOwnership::new(state, play_session_id);
     let response = STARTUP_HEDGE_CLIENT
         .get(&url)
         .header(http::header::RANGE, format!("bytes={next_offset}-"))
@@ -501,6 +559,7 @@ async fn prebuffer_auto_source(
                 required_mbps = plan.required_bitrate_bps / 1_000_000.0,
                 "Auto prebuffer reached safe playback runway"
             );
+            ownership.hand_off();
             return Ok(());
         }
     }
@@ -2519,6 +2578,11 @@ pub async fn master_hls_video(
                     error = %error_text,
                     "Playback startup failed"
                 );
+                state
+                    .ctx
+                    .torrent
+                    .release_playback(play_session_id)
+                    .await;
             }
             return Ok(axum::response::Redirect::temporary("/videos/no-streams")
                 .into_response());
@@ -3961,6 +4025,26 @@ mod tests {
             required_bitrate_bps: required_mbps.map(|value| value * 1_000_000.0),
             error: None,
         }
+    }
+
+    #[test]
+    fn auto_prebuffer_stream_is_owned_by_the_playback_session() {
+        let media_id =
+            uuid::Uuid::parse_str("723fb86d-f8df-548b-b4b1-169f8ec3f475").unwrap();
+        let url = url::Url::parse(&super::auto_prebuffer_url(
+            3000,
+            media_id,
+            "play/session 1",
+        ))
+        .unwrap();
+
+        assert_eq!(url.path(), "/stream/723fb86d-f8df-548b-b4b1-169f8ec3f475");
+        assert!(
+            url.query_pairs()
+                .any(|(key, value)| {
+                    key == "PlaySessionId" && value == "play/session 1"
+                })
+        );
     }
 
     #[test]

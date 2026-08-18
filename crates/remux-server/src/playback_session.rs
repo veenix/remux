@@ -1,6 +1,10 @@
 use chrono::{DateTime, Utc};
 use dashmap::DashMap;
-use std::{path::PathBuf, sync::Arc, time::Duration};
+use std::{
+    path::PathBuf,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
 use uuid::Uuid;
@@ -38,33 +42,336 @@ pub struct PlaybackSession {
 }
 
 #[derive(Clone)]
+struct PlaybackStartup {
+    started_at: DateTime<Utc>,
+    started: Instant,
+    item_id: Uuid,
+    user_id: Uuid,
+    device_id: String,
+    client_name: String,
+    media_source_id: Option<Uuid>,
+    playback_info_ready: Option<Duration>,
+    hls_requested: Option<Duration>,
+    source_selected: Option<Duration>,
+    transcode_started: Option<Duration>,
+    first_segment_served: Option<Duration>,
+}
+
+#[derive(Clone, Debug)]
+pub struct PlaybackStartupReport {
+    pub play_session_id: String,
+    pub item_id: Uuid,
+    pub media_source_id: Option<Uuid>,
+    pub user_id: Uuid,
+    pub device_id: String,
+    pub client_name: String,
+    pub outcome: String,
+    pub started_at: DateTime<Utc>,
+    pub playback_info_ms: Option<i64>,
+    pub hls_requested_ms: Option<i64>,
+    pub source_selected_ms: Option<i64>,
+    pub transcode_started_ms: Option<i64>,
+    pub first_segment_served_ms: Option<i64>,
+    pub first_progress_ms: Option<i64>,
+    pub estimated_actual_playback_ms: Option<i64>,
+    pub confirmation_delay_ms: Option<i64>,
+    pub failure_reason: Option<String>,
+}
+
+#[derive(Clone)]
 pub struct PlaybackSessionManager {
     sessions: Arc<DashMap<String, PlaybackSession>>,
+    startups: Arc<DashMap<String, PlaybackStartup>>,
     base_dir: PathBuf,
+}
+
+#[cfg(unix)]
+fn cleanup_stale_transcodes(base_dir: &std::path::Path) {
+    use std::collections::HashSet;
+
+    let mut pids = HashSet::new();
+    // Restrict the process scan to ffmpeg commands that explicitly write
+    // beneath this exact transcode directory. We intentionally do not trust
+    // stale .pid files: their PID may have been reused by an unrelated process.
+    if let Ok(output) = std::process::Command::new("ps")
+        .args(["-axo", "pid=,command="])
+        .output()
+    {
+        let base = base_dir.to_string_lossy();
+        for line in String::from_utf8_lossy(&output.stdout).lines() {
+            let line = line.trim_start();
+            let Some((pid, command)) = line.split_once(char::is_whitespace) else {
+                continue;
+            };
+            if command.contains("ffmpeg") && command.contains(base.as_ref()) {
+                if let Ok(pid) = pid.parse::<libc::pid_t>() {
+                    if pid > 0 {
+                        pids.insert(pid);
+                    }
+                }
+            }
+        }
+    }
+
+    for pid in &pids {
+        unsafe {
+            libc::kill(*pid, libc::SIGCONT);
+            libc::kill(*pid, libc::SIGKILL);
+        }
+    }
+    if !pids.is_empty() {
+        info!(
+            count = pids.len(),
+            "killed stale transcode processes at startup"
+        );
+    }
+    let _ = std::fs::remove_dir_all(base_dir);
+}
+
+#[cfg(not(unix))]
+fn cleanup_stale_transcodes(base_dir: &std::path::Path) {
+    let _ = std::fs::remove_dir_all(base_dir);
 }
 
 impl PlaybackSessionManager {
     pub fn new(base_dir: impl Into<PathBuf>) -> Self {
         let base_dir = base_dir.into();
+        cleanup_stale_transcodes(&base_dir);
         let _ = std::fs::create_dir_all(&base_dir);
         Self {
             sessions: Arc::new(DashMap::new()),
+            startups: Arc::new(DashMap::new()),
             base_dir,
         }
+    }
+
+    /// Start a server-side latency trace at the first PlaybackInfo request. The
+    /// client does not expose its click timestamp through Jellyfin's API, so
+    /// this is the earliest consistent boundary available for every client.
+    pub fn begin_startup(
+        &self,
+        play_session_id: &str,
+        item_id: Uuid,
+        user_id: Uuid,
+        device_id: &str,
+        client_name: &str,
+    ) {
+        if self
+            .startups
+            .len()
+            > 128
+        {
+            self.startups
+                .retain(|_, startup| {
+                    startup
+                        .started
+                        .elapsed()
+                        < Duration::from_secs(30 * 60)
+                });
+        }
+        self.startups
+            .insert(
+                play_session_id.to_string(),
+                PlaybackStartup {
+                    started_at: Utc::now(),
+                    started: Instant::now(),
+                    item_id,
+                    user_id,
+                    device_id: device_id.to_string(),
+                    client_name: client_name.to_string(),
+                    media_source_id: None,
+                    playback_info_ready: None,
+                    hls_requested: None,
+                    source_selected: None,
+                    transcode_started: None,
+                    first_segment_served: None,
+                },
+            );
+    }
+
+    fn mark_startup<F>(&self, play_session_id: &str, update: F)
+    where
+        F: FnOnce(&mut PlaybackStartup, Duration),
+    {
+        if let Some(mut startup) = self
+            .startups
+            .get_mut(play_session_id)
+        {
+            let elapsed = startup
+                .started
+                .elapsed();
+            update(startup.value_mut(), elapsed);
+        }
+    }
+
+    pub fn mark_playback_info_ready(&self, play_session_id: &str) {
+        self.mark_startup(play_session_id, |startup, elapsed| {
+            startup
+                .playback_info_ready
+                .get_or_insert(elapsed);
+        });
+    }
+
+    pub fn mark_hls_requested(&self, play_session_id: &str) {
+        self.mark_startup(play_session_id, |startup, elapsed| {
+            startup
+                .hls_requested
+                .get_or_insert(elapsed);
+        });
+    }
+
+    pub fn mark_source_selected(&self, play_session_id: &str, media_source_id: Uuid) {
+        self.mark_startup(play_session_id, |startup, elapsed| {
+            startup.source_selected = Some(elapsed);
+            startup.media_source_id = Some(media_source_id);
+        });
+    }
+
+    pub fn mark_transcode_started(&self, play_session_id: &str) {
+        self.mark_startup(play_session_id, |startup, elapsed| {
+            startup
+                .transcode_started
+                .get_or_insert(elapsed);
+        });
+    }
+
+    pub fn mark_first_segment_served(&self, play_session_id: &str) {
+        self.mark_startup(play_session_id, |startup, elapsed| {
+            startup
+                .first_segment_served
+                .get_or_insert(elapsed);
+        });
+    }
+
+    fn duration_ms(duration: Option<Duration>) -> Option<i64> {
+        duration.map(|duration| {
+            duration
+                .as_millis()
+                .min(i64::MAX as u128) as i64
+        })
+    }
+
+    fn startup_report(
+        play_session_id: String,
+        startup: PlaybackStartup,
+        outcome: &str,
+        first_progress: Option<Duration>,
+        estimated_actual_playback: Option<Duration>,
+        failure_reason: Option<String>,
+    ) -> PlaybackStartupReport {
+        let confirmation_delay = first_progress
+            .zip(estimated_actual_playback)
+            .map(|(confirmed, estimated)| confirmed.saturating_sub(estimated));
+        PlaybackStartupReport {
+            play_session_id,
+            item_id: startup.item_id,
+            media_source_id: startup.media_source_id,
+            user_id: startup.user_id,
+            device_id: startup.device_id,
+            client_name: startup.client_name,
+            outcome: outcome.to_string(),
+            started_at: startup.started_at,
+            playback_info_ms: Self::duration_ms(startup.playback_info_ready),
+            hls_requested_ms: Self::duration_ms(startup.hls_requested),
+            source_selected_ms: Self::duration_ms(startup.source_selected),
+            transcode_started_ms: Self::duration_ms(startup.transcode_started),
+            first_segment_served_ms: Self::duration_ms(startup.first_segment_served),
+            first_progress_ms: Self::duration_ms(first_progress),
+            estimated_actual_playback_ms: Self::duration_ms(estimated_actual_playback),
+            confirmation_delay_ms: Self::duration_ms(confirmation_delay),
+            failure_reason,
+        }
+    }
+
+    /// Confirm real playback from the first advancing, unpaused progress report.
+    /// Jellyfin clients report current media time rather than the instant the
+    /// first frame was rendered, so backdate the report by the amount advanced.
+    /// The first served media segment is a hard lower bound for that estimate.
+    pub fn confirm_startup(
+        &self,
+        play_session_id: &str,
+        initial_position_ticks: i64,
+        position_ticks: Option<i64>,
+        is_paused: bool,
+    ) -> Option<PlaybackStartupReport> {
+        if is_paused {
+            return None;
+        }
+        let advanced_ticks = position_ticks?
+            .saturating_sub(initial_position_ticks)
+            .max(0);
+        if advanced_ticks == 0 {
+            return None;
+        }
+        let (_, startup) = self
+            .startups
+            .remove(play_session_id)?;
+        let confirmed = startup
+            .started
+            .elapsed();
+        let advanced =
+            Duration::from_nanos((advanced_ticks as u64).saturating_mul(100));
+        let mut estimated = confirmed.saturating_sub(advanced);
+        if let Some(first_segment) = startup.first_segment_served {
+            estimated = estimated.max(first_segment);
+        }
+        Some(Self::startup_report(
+            play_session_id.to_string(),
+            startup,
+            "started",
+            Some(confirmed),
+            Some(estimated),
+            None,
+        ))
+    }
+
+    pub fn fail_startup(
+        &self,
+        play_session_id: &str,
+        reason: impl Into<String>,
+    ) -> Option<PlaybackStartupReport> {
+        self.end_startup(play_session_id, "failed", reason)
+    }
+
+    pub fn abandon_startup(
+        &self,
+        play_session_id: &str,
+        reason: impl Into<String>,
+    ) -> Option<PlaybackStartupReport> {
+        self.end_startup(play_session_id, "abandoned", reason)
+    }
+
+    fn end_startup(
+        &self,
+        play_session_id: &str,
+        outcome: &str,
+        reason: impl Into<String>,
+    ) -> Option<PlaybackStartupReport> {
+        let (_, startup) = self
+            .startups
+            .remove(play_session_id)?;
+        Some(Self::startup_report(
+            play_session_id.to_string(),
+            startup,
+            outcome,
+            None,
+            None,
+            Some(reason.into()),
+        ))
     }
 
     /// Handle a `POST /sessions/playing` report.
     ///
     /// Enforces the per-user session limit, resolves the optional StreamGroup
     /// source, builds and inserts the `PlaybackSession`, and emits the playback-
-    /// start log line (skipped for transcode — the HLS handler logs that after
+    /// session-start log line (skipped for transcode — the HLS handler logs after
     /// it has codec/bitrate/reason details).
     pub async fn start(
         &self,
         db: &sqlx::SqlitePool,
         auth_session: &auth::AuthSession,
         data: &PlaybackInfo,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<Vec<String>> {
         let play_session_id = data
             .play_session_id
             .clone()
@@ -106,7 +413,7 @@ impl PlaybackSessionManager {
                 client = %auth_session.device.app_name,
                 "PlaybackStart missing item_id, skipping session creation"
             );
-            return Ok(());
+            return Ok(Vec::new());
         }
 
         // If the client selected a StreamGroup source, record its group UUID.
@@ -179,6 +486,14 @@ impl PlaybackSessionManager {
             item_kind,
         };
 
+        let stopped_sessions = self
+            .stop_other_for_device(
+                &auth_session
+                    .device
+                    .id,
+                &play_session_id,
+            )
+            .await;
         self.insert(ps);
 
         // For transcode sessions, master_hls_video fires the info log once it
@@ -237,11 +552,11 @@ impl PlaybackSessionManager {
                 audio_stream = ?data.audio_stream_index,
                 subtitle_stream = ?data.subtitle_stream_index,
                 position_secs,
-                "▶ Playback started"
+                "Playback session started"
             );
         }
 
-        Ok(())
+        Ok(stopped_sessions)
     }
 
     /// Handle a `POST /sessions/playing/progress` report.
@@ -285,6 +600,33 @@ impl PlaybackSessionManager {
         } else {
             ps.item_id
         };
+
+        if let Some(report) = self.confirm_startup(
+            psid,
+            ps.position_ticks,
+            data.position_ticks,
+            data.is_paused,
+        ) {
+            if let Err(error) = db::record_playback_startup(db, &report).await {
+                warn!(%error, play_session_id = psid, "failed to persist playback startup metric");
+            }
+            info!(
+                play_session_id = %report.play_session_id,
+                item_id = %report.item_id,
+                media_source_id = ?report.media_source_id,
+                user_id = %report.user_id,
+                client = %report.client_name,
+                playback_info_ms = ?report.playback_info_ms,
+                hls_requested_ms = ?report.hls_requested_ms,
+                source_selected_ms = ?report.source_selected_ms,
+                transcode_started_ms = ?report.transcode_started_ms,
+                first_segment_served_ms = ?report.first_segment_served_ms,
+                first_progress_ms = ?report.first_progress_ms,
+                estimated_actual_playback_ms = ?report.estimated_actual_playback_ms,
+                confirmation_delay_ms = ?report.confirmation_delay_ms,
+                "▶ Actual playback confirmed"
+            );
+        }
 
         // Detect encode-parameter changes and log them once.
         // We ignore pause/unpause — those are not encode changes.
@@ -882,4 +1224,109 @@ async fn kill_transcode(ts: Arc<tokio::sync::RwLock<TranscodeSession>>) {
         notification.await;
     }
     let _ = std::fs::remove_dir_all(&output_dir);
+}
+
+#[cfg(test)]
+mod startup_metric_tests {
+    use super::*;
+
+    #[test]
+    fn progress_backdates_actual_playback_but_not_before_first_segment() {
+        let temp = tempfile::tempdir().unwrap();
+        let manager = PlaybackSessionManager::new(temp.path());
+        let play_session_id = "startup-test";
+        manager.begin_startup(
+            play_session_id,
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            "device",
+            "client",
+        );
+        manager.mark_first_segment_served(play_session_id);
+        {
+            let mut startup = manager
+                .startups
+                .get_mut(play_session_id)
+                .unwrap();
+            startup.started = Instant::now() - Duration::from_secs(10);
+            startup.first_segment_served = Some(Duration::from_secs(3));
+        }
+
+        let report = manager
+            .confirm_startup(play_session_id, 0, Some(9 * 10_000_000), false)
+            .unwrap();
+
+        assert_eq!(report.outcome, "started");
+        assert_eq!(report.estimated_actual_playback_ms, Some(3_000));
+        assert!(
+            report
+                .first_progress_ms
+                .is_some_and(|value| value >= 9_900)
+        );
+        assert!(
+            report
+                .confirmation_delay_ms
+                .is_some_and(|value| value >= 6_900)
+        );
+    }
+
+    #[test]
+    fn paused_or_nonadvancing_progress_does_not_confirm_playback() {
+        let temp = tempfile::tempdir().unwrap();
+        let manager = PlaybackSessionManager::new(temp.path());
+        manager.begin_startup(
+            "paused-test",
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            "device",
+            "client",
+        );
+
+        assert!(
+            manager
+                .confirm_startup("paused-test", 0, Some(10_000_000), true)
+                .is_none()
+        );
+        assert!(
+            manager
+                .confirm_startup("paused-test", 0, Some(0), false)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn stopping_before_progress_records_an_abandoned_attempt() {
+        let temp = tempfile::tempdir().unwrap();
+        let manager = PlaybackSessionManager::new(temp.path());
+        manager.begin_startup(
+            "abandoned-test",
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            "device",
+            "client",
+        );
+        manager.mark_hls_requested("abandoned-test");
+
+        let report = manager
+            .abandon_startup("abandoned-test", "client stopped")
+            .unwrap();
+
+        assert_eq!(report.outcome, "abandoned");
+        assert_eq!(
+            report
+                .failure_reason
+                .as_deref(),
+            Some("client stopped")
+        );
+        assert!(
+            report
+                .hls_requested_ms
+                .is_some()
+        );
+        assert!(
+            manager
+                .abandon_startup("abandoned-test", "duplicate stop")
+                .is_none()
+        );
+    }
 }

@@ -12,7 +12,7 @@ use serde::Deserialize;
 use serde_json::json;
 use serde_with::{DurationSeconds, serde_as};
 use std::time::Duration;
-use tracing::info;
+use tracing::{info, warn};
 use uuid::Uuid;
 
 use crate::{
@@ -25,6 +25,47 @@ use crate::{
     playback::session::TranscodeSession,
     services::{self, MediaResolveService},
 };
+
+pub(crate) async fn abandon_playback_startup(
+    state: &AppState,
+    play_session_id: &str,
+    reason: &str,
+) {
+    let Some(report) = state
+        .ctx
+        .sessions
+        .abandon_startup(play_session_id, reason)
+    else {
+        return;
+    };
+    if let Err(error) = db::record_playback_startup(
+        &state
+            .ctx
+            .db,
+        &report,
+    )
+    .await
+    {
+        warn!(
+            %error,
+            play_session_id,
+            "failed to persist abandoned playback startup metric"
+        );
+    }
+    info!(
+        play_session_id = %report.play_session_id,
+        item_id = %report.item_id,
+        media_source_id = ?report.media_source_id,
+        client = %report.client_name,
+        playback_info_ms = ?report.playback_info_ms,
+        hls_requested_ms = ?report.hls_requested_ms,
+        source_selected_ms = ?report.source_selected_ms,
+        transcode_started_ms = ?report.transcode_started_ms,
+        first_segment_served_ms = ?report.first_segment_served_ms,
+        reason = ?report.failure_reason,
+        "Playback ended before actual playback was confirmed"
+    );
+}
 
 #[post("/sessions/logout")]
 pub async fn sessions_logout(
@@ -264,6 +305,12 @@ pub async fn report_playback_stopped(
                 .map(|playback| playback.item_id)
                 .filter(|item_id| !item_id.is_nil())
         });
+        abandon_playback_startup(
+            &state,
+            psid,
+            "client stopped before advancing playback",
+        )
+        .await;
         // Whether this counted as a watch is decided by the threshold check
         // inside `stopped`, so its answer is carried out rather than inferred
         // from `played_at`, which stays set from every earlier watch.

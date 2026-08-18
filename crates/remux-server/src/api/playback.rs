@@ -146,6 +146,25 @@ async fn items_playbackinfo_inner(
     q: api::PlaybackInfoQuery,
 ) -> Result<impl IntoResponse> {
     let media_source_id = q.media_source_id;
+    let play_session_id = common::get_uuid()
+        .as_simple()
+        .to_string();
+    state
+        .ctx
+        .sessions
+        .begin_startup(
+            &play_session_id,
+            id,
+            session
+                .user
+                .id,
+            &session
+                .device
+                .id,
+            &session
+                .device
+                .app_name,
+        );
 
     trace!(?id, ?q, "items_playbackinfo");
 
@@ -237,10 +256,6 @@ async fn items_playbackinfo_inner(
         (Some(a), Some(b)) => Some(a.min(b)),
         (a, b) => a.or(b),
     };
-
-    let play_session_id = common::get_uuid()
-        .as_simple()
-        .to_string();
 
     let subtitle_mode = encoding_cfg
         .subtitle_mode
@@ -676,11 +691,15 @@ async fn items_playbackinfo_inner(
 
     let info = api::PlaybackInfoResponse {
         media_sources,
-        play_session_id: Some(play_session_id),
+        play_session_id: Some(play_session_id.clone()),
         // error_code,
         ..Default::default()
     };
 
+    state
+        .ctx
+        .sessions
+        .mark_playback_info_ready(&play_session_id);
     trace!(?info, "items_playbackinfo_result");
     Ok(Json(info))
 }

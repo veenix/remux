@@ -138,8 +138,26 @@ pub(crate) fn select_hw_accel(
 
 /// Max seconds to buffer ahead of the current playback position.
 const MAX_BUFFER_SECS: u32 = 300;
+/// Minimum safety window when production is comfortably faster than playback.
+const MIN_BUFFER_SECS: u32 = 30;
 /// Seconds behind the playback position before a segment is eligible for deletion.
 const SEGMENT_KEEP_SECS: u32 = 30;
+
+/// Convert observed media-production speed into a safety buffer. A ratio of
+/// 2.0 means one second of wall time produces two seconds of playable media.
+/// The target is the time needed to refill a 30-second disruption, clamped to
+/// a practical viewing window. This adapts to source bitrate, swarm speed, and
+/// transcode cost without using torrent-size percentages.
+fn adaptive_buffer_secs(production_ratio: f64, segment_length: u32) -> u32 {
+    if !production_ratio.is_finite() || production_ratio <= 1.05 {
+        return MAX_BUFFER_SECS;
+    }
+    let recovery_secs = MIN_BUFFER_SECS as f64 / (production_ratio - 1.0);
+    let raw = recovery_secs
+        .ceil()
+        .clamp(MIN_BUFFER_SECS as f64, MAX_BUFFER_SECS as f64) as u32;
+    raw.div_ceil(segment_length.max(1)) * segment_length.max(1)
+}
 
 fn ffmpeg_bin() -> String {
     std::env::var("FFMPEG_PATH").unwrap_or_else(|_| "ffmpeg".into())
@@ -166,6 +184,10 @@ fn spawn_buffer_monitor(
     tokio::spawn(async move {
         let mut paused = false;
         let mut ticks: u32 = 0;
+        let mut target_buffer_secs = MAX_BUFFER_SECS;
+        let mut last_sample_at = std::time::Instant::now();
+        let mut last_sample_segments = 0u32;
+        let mut production_ratio_ema: Option<f64> = None;
         loop {
             tokio::select! {
                 _ = &mut stop_rx => break,
@@ -182,14 +204,47 @@ fn spawn_buffer_monitor(
 
             let ahead = buffered_secs.saturating_sub(playback_secs);
 
-            if pid != 0 && !paused && ahead >= MAX_BUFFER_SECS {
-                debug!(play_session_id, pid, ahead, "Buffer full — pausing ffmpeg");
+            if ticks % 5 == 0 {
+                let elapsed = last_sample_at
+                    .elapsed()
+                    .as_secs_f64();
+                let produced_media_secs = produced
+                    .saturating_sub(last_sample_segments)
+                    .saturating_mul(segment_length)
+                    as f64;
+                if elapsed > 0.0 && produced_media_secs > 0.0 {
+                    let sample = produced_media_secs / elapsed;
+                    let smoothed = production_ratio_ema
+                        .map(|previous| previous * 0.65 + sample * 0.35)
+                        .unwrap_or(sample);
+                    production_ratio_ema = Some(smoothed);
+                    let new_target = adaptive_buffer_secs(smoothed, segment_length);
+                    if new_target != target_buffer_secs {
+                        debug!(
+                            play_session_id,
+                            production_ratio = smoothed,
+                            old_target_secs = target_buffer_secs,
+                            new_target_secs = new_target,
+                            "Adjusted playback buffer to observed production speed"
+                        );
+                        target_buffer_secs = new_target;
+                    }
+                }
+                last_sample_at = std::time::Instant::now();
+                last_sample_segments = produced;
+            }
+
+            if pid != 0 && !paused && ahead >= target_buffer_secs {
+                debug!(
+                    play_session_id,
+                    pid, ahead, target_buffer_secs, "Buffer full — pausing ffmpeg"
+                );
                 #[cfg(unix)]
                 send_signal(pid, libc::SIGSTOP);
                 paused = true;
             } else if pid != 0
                 && paused
-                && ahead < MAX_BUFFER_SECS.saturating_sub(segment_length * 2)
+                && ahead < target_buffer_secs.saturating_sub(segment_length * 2)
             {
                 debug!(
                     play_session_id,
@@ -268,7 +323,7 @@ pub struct TranscodeParams {
     pub output_dir: PathBuf,
     pub video_codec: String, // "copy", "libx264", "libx265"
     pub audio_codec: String, // "aac", "copy"
-    pub segment_length: u32, // seconds (default 6)
+    pub segment_length: u32, // seconds (default 4)
     pub start_time_ticks: Option<i64>,
     pub max_width: Option<u32>,
     pub max_height: Option<u32>,
@@ -325,7 +380,7 @@ impl Default for TranscodeParams {
             output_dir: PathBuf::new(),
             video_codec: "copy".to_string(),
             audio_codec: "aac".to_string(),
-            segment_length: 6,
+            segment_length: 4,
             start_time_ticks: None,
             max_width: None,
             max_height: None,
@@ -1955,6 +2010,14 @@ mod tests {
     use std::path::PathBuf;
     use uuid::Uuid;
 
+    #[test]
+    fn adaptive_buffer_tracks_production_margin() {
+        assert_eq!(adaptive_buffer_secs(1.0, 6), MAX_BUFFER_SECS);
+        assert_eq!(adaptive_buffer_secs(1.25, 6), 120);
+        assert_eq!(adaptive_buffer_secs(2.0, 6), MIN_BUFFER_SECS);
+        assert_eq!(adaptive_buffer_secs(10.0, 6), MIN_BUFFER_SECS);
+    }
+
     fn args_contains(args: &[String], flag: &str) -> bool {
         args.iter()
             .any(|a| a == flag)
@@ -2336,8 +2399,8 @@ mod tests {
         assert!(ss_pos < i_pos, "-ss must come before -i");
         assert_eq!(args[ss_pos + 1], "30.000000");
 
-        // start_number = floor(30 / 6) = 5
-        assert_eq!(arg_after(&args, "-start_number"), Some("5"));
+        // Default segment length is 4 seconds: floor(30 / 4) = 7.
+        assert_eq!(arg_after(&args, "-start_number"), Some("7"));
     }
 
     #[test]
@@ -2364,7 +2427,7 @@ mod tests {
             audio_stream_index: None,
             subtitle_stream_index: None,
             burn_subtitle: false,
-            segment_length: 6,
+            segment_length: 4,
             transcode_reasons: TranscodeReasons::default(),
             kill_tx: None,
             wait_done: Arc::new(tokio::sync::Notify::new()),
@@ -2390,8 +2453,8 @@ mod tests {
         let playlist = generate_variant_playlist(&session, "");
 
         assert!(playlist.contains("#EXT-X-START:TIME-OFFSET=30.000000,PRECISE=YES"));
-        assert!(playlist.contains("segment_00000.ts?PlaySessionId=play-session&runtimeTicks=0&actualSegmentLengthTicks=60000000"));
-        assert!(playlist.contains("segment_00005.ts?PlaySessionId=play-session&runtimeTicks=300000000&actualSegmentLengthTicks=60000000"));
+        assert!(playlist.contains("segment_00000.ts?PlaySessionId=play-session&runtimeTicks=0&actualSegmentLengthTicks=40000000"));
+        assert!(playlist.contains("segment_00007.ts?PlaySessionId=play-session&runtimeTicks=280000000&actualSegmentLengthTicks=40000000"));
     }
 
     #[test]

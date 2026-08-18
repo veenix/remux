@@ -66,6 +66,7 @@ pub mod services;
 pub mod stream;
 pub mod tasks;
 mod torrent;
+mod torrent_availability;
 mod web_client;
 mod web_patches;
 mod web_transform;

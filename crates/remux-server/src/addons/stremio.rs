@@ -1559,7 +1559,18 @@ async fn stremio_streams(
                     .description
                     .clone(),
                 filename: metadata.filename,
-                seeders: metadata.seeders,
+                seeders: metadata
+                    .seeders
+                    .or_else(|| {
+                        parse_seeders_from_strings(&[
+                            s.name
+                                .as_deref(),
+                            s.description
+                                .as_deref(),
+                            s.title
+                                .as_deref(),
+                        ])
+                    }),
                 size: sd
                     .and_then(|d| d.size)
                     .or(s.size),
@@ -1608,6 +1619,49 @@ async fn stremio_streams(
             })
         })
         .collect())
+}
+
+fn parse_seeders_from_strings(candidates: &[Option<&str>]) -> Option<i64> {
+    for s in candidates
+        .iter()
+        .filter_map(|s| *s)
+    {
+        // Torrentio emoji: "👤 12" or "Seeds: 12" / "seeders 12"
+        if let Some(n) = parse_seeders_one(s) {
+            return Some(n);
+        }
+    }
+    None
+}
+
+fn parse_seeders_one(s: &str) -> Option<i64> {
+    // Regex-free: look for "👤" then digits, or an explicit seeder label.
+    if let Some(idx) = s.find('👤') {
+        let rest = &s[idx + '👤'.len_utf8()..];
+        let digits: String = rest
+            .chars()
+            .skip_while(|c| !c.is_ascii_digit())
+            .take_while(|c| c.is_ascii_digit())
+            .collect();
+        if let Ok(n) = digits.parse::<i64>() {
+            return Some(n);
+        }
+    }
+    let lower = s.to_ascii_lowercase();
+    for needle in ["seeders", "seeds"] {
+        if let Some(pos) = lower.find(needle) {
+            let rest = &s[pos + needle.len()..];
+            let digits: String = rest
+                .chars()
+                .skip_while(|c| !c.is_ascii_digit())
+                .take_while(|c| c.is_ascii_digit())
+                .collect();
+            if let Ok(n) = digits.parse::<i64>() {
+                return Some(n);
+            }
+        }
+    }
+    None
 }
 
 #[cfg(test)]
@@ -1660,6 +1714,13 @@ mod tests {
         );
         assert_eq!(metadata.seeders, Some(84));
         assert_eq!(metadata.file_idx, Some(7));
+    }
+
+    #[test]
+    fn parses_only_explicit_seeder_counts() {
+        assert_eq!(parse_seeders_one("👤 42"), Some(42));
+        assert_eq!(parse_seeders_one("Seeds: 0"), Some(0));
+        assert_eq!(parse_seeders_one("Peers: 99"), None);
     }
 
     #[test]

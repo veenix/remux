@@ -285,10 +285,27 @@ impl StreamGroup {
             }
 
             if !group.hidden {
-                // Only the first (highest-priority) match is shown.
-                // group_id marks it as a group representative; the real stream
-                // UUID stays in best.id so internal probe URLs stay correct.
-                let mut best = matching[0].clone();
+                // Pick best by seeders (torrent health) then idx, so the group
+                // representative shows the healthiest stream.
+                let mut sorted: Vec<&Media> = matching.clone();
+                sorted.sort_by(|a, b| {
+                    let sa = a
+                        .stream_info
+                        .as_ref()
+                        .and_then(|si| si.seeders)
+                        .unwrap_or(0);
+                    let sb = b
+                        .stream_info
+                        .as_ref()
+                        .and_then(|si| si.seeders)
+                        .unwrap_or(0);
+                    sb.cmp(&sa)
+                        .then_with(|| {
+                            a.idx
+                                .cmp(&b.idx)
+                        })
+                });
+                let mut best = sorted[0].clone();
                 best.title = group.display_name();
                 best.group_id = Some(group.id);
                 result.push(best);

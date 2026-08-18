@@ -80,7 +80,7 @@ pub enum StreamDescriptor {
         info_hash: String,
         /// Filename hint for multi-file torrents (matched by name).
         file_hint: Option<String>,
-        /// Direct file index within the torrent (takes precedence over file_hint).
+        /// Direct file index within the torrent (used when the filename hint cannot match).
         file_idx: Option<usize>,
         /// Tracker announce URLs (populated from the stream's `sources`).
         #[serde(default, deserialize_with = "deserialize_tracker_urls")]
@@ -156,6 +156,51 @@ impl StreamDescriptor {
             Self::Opendal { addon_id, .. } => Some(*addon_id),
             _ => None,
         }
+    }
+
+    pub(crate) fn torrent_info_hash(&self) -> Option<&str> {
+        match self {
+            Self::Torrent { info_hash, .. } => Some(info_hash),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn torrent_trackers(&self) -> Option<&[TrackerUrl]> {
+        match self {
+            Self::Torrent { trackers, .. } => Some(trackers),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn torrent_magnet(&self) -> Option<String> {
+        let Self::Torrent {
+            info_hash,
+            file_hint,
+            file_idx,
+            trackers,
+        } = self
+        else {
+            return None;
+        };
+
+        let mut magnet = format!("magnet:?xt=urn:btih:{info_hash}");
+        if trackers.is_empty() {
+            for tracker in DEFAULT_TRACKERS {
+                magnet.push_str(&format!("&tr={}", urlencoding::encode(tracker)));
+            }
+        } else {
+            for tracker in trackers {
+                let tracker: &str = tracker.as_ref();
+                magnet.push_str(&format!("&tr={}", urlencoding::encode(tracker)));
+            }
+        }
+        if let Some(idx) = file_idx {
+            magnet.push_str(&format!("&file_idx={idx}"));
+        }
+        if let Some(hint) = file_hint {
+            magnet.push_str(&format!("&file={}", urlencoding::encode(hint)));
+        }
+        Some(magnet)
     }
 
     /// Instantiate the runtime service for self-contained variants.
@@ -267,6 +312,27 @@ impl StreamInfo {
                 .as_deref())?;
         crate::db::min_screen_size(&hunch::hunch(src)).map(|s| s.to_owned())
     }
+
+    pub(crate) fn torrent_magnet(&self) -> Option<String> {
+        let mut magnet = self
+            .descriptor
+            .torrent_magnet()?;
+        if matches!(
+            &self.descriptor,
+            StreamDescriptor::Torrent {
+                file_hint: None,
+                ..
+            }
+        ) {
+            if let Some(filename) = self
+                .filename
+                .as_deref()
+            {
+                magnet.push_str(&format!("&file={}", urlencoding::encode(filename)));
+            }
+        }
+        Some(magnet)
+    }
 }
 
 /// A runtime service that can serve stream bytes as an HTTP response.
@@ -302,7 +368,7 @@ pub struct LocalSource {
 
 /// Public trackers used as fallback when a torrent stream provides none.
 /// Sourced from https://github.com/ngosang/trackerslist (trackers_best).
-const DEFAULT_TRACKERS: &[&str] = &[
+pub(crate) const DEFAULT_TRACKERS: &[&str] = &[
     "udp://tracker.opentrackr.org:1337/announce",
     "udp://open.demonii.com:1337/announce",
     "udp://open.stealth.si:80/announce",
@@ -341,13 +407,46 @@ impl TorrentSource {
         }
         m
     }
+
+    pub async fn serve_for_playback(
+        &self,
+        state: &AppState,
+        headers: &HeaderMap,
+        playback_ids: &[String],
+    ) -> Result<Response> {
+        let resolved = state
+            .ctx
+            .torrent
+            .resolve_url(&self.to_magnet(), playback_ids)
+            .await
+            .context_bad_request("failed to resolve torrent")?;
+
+        HttpSource {
+            url: resolved.url,
+            request_headers: Default::default(),
+            response_headers: Default::default(),
+        }
+        .serve_with_guard(headers, Some(resolved.guard))
+        .await
+    }
 }
 
 impl HttpSource {
+    async fn serve_with_guard(
+        &self,
+        headers: &HeaderMap,
+        guard: Option<crate::torrent::TorrentStreamGuard>,
+    ) -> Result<Response> {
+        let bound_finite_ranges = guard.is_some();
+        self.serve_inner(headers, bound_finite_ranges, guard)
+            .await
+    }
+
     async fn serve_inner(
         &self,
         headers: &HeaderMap,
         bound_finite_ranges: bool,
+        guard: Option<crate::torrent::TorrentStreamGuard>,
     ) -> Result<Response> {
         let requested_range = bound_finite_ranges
             .then(|| {
@@ -365,8 +464,9 @@ impl HttpSource {
             .clone()
             .get(&self.url);
         if let Some((start, _)) = requested_range {
-            // librqbit accepts only `bytes=N-`. Normalize finite ranges and
-            // cap the proxied response body to the client's requested length.
+            // librqbit accepts only `bytes=N-`. Normalize finite client ranges
+            // and cap the response body below, which also prevents a small
+            // finite request from proxying the entire media file.
             req = req.header(http::header::RANGE, format!("bytes={start}-"));
         } else if let Some(v) = headers.get(http::header::RANGE) {
             req = req.header(http::header::RANGE, v.clone());
@@ -406,18 +506,32 @@ impl HttpSource {
                 let end = total_length
                     .map(|total| requested_end.min(total.saturating_sub(1)))
                     .unwrap_or(requested_end);
-                let length = end
-                    .saturating_sub(start)
-                    .saturating_add(1);
-                (start, end, length)
+                (
+                    start,
+                    end,
+                    end.saturating_sub(start)
+                        .saturating_add(1),
+                )
             });
         let stream = upstream
             .bytes_stream()
             .map_err(io::Error::other);
-        let body = if let Some((_, _, length)) = bounded_range {
-            Body::from_stream(ReaderStream::new(StreamReader::new(stream).take(length)))
-        } else {
-            Body::from_stream(stream)
+        let body = match (bounded_range, guard) {
+            (Some((_, _, length)), Some(guard)) => {
+                let reader = StreamReader::new(stream).take(length);
+                Body::from_stream(ReaderStream::new(reader).map(move |chunk| {
+                    let _keep_alive = &guard;
+                    chunk
+                }))
+            }
+            (Some((_, _, length)), None) => Body::from_stream(ReaderStream::new(
+                StreamReader::new(stream).take(length),
+            )),
+            (None, Some(guard)) => Body::from_stream(stream.map(move |chunk| {
+                let _keep_alive = &guard;
+                chunk
+            })),
+            (None, None) => Body::from_stream(stream),
         };
 
         let mut resp = Response::builder()
@@ -453,6 +567,14 @@ impl HttpSource {
                     .expect("range is a valid header"),
             );
         }
+        for (name, value) in &self.response_headers {
+            if let (Ok(name), Ok(value)) = (
+                http::header::HeaderName::try_from(name.as_str()),
+                http::HeaderValue::try_from(value.as_str()),
+            ) {
+                out.insert(name, value);
+            }
+        }
         if !out.contains_key(http::header::CONTENT_TYPE) {
             out.insert(
                 http::header::CONTENT_TYPE,
@@ -486,7 +608,7 @@ fn parse_open_or_finite_range(range: &str) -> Option<(u64, Option<u64>)> {
 #[async_trait]
 impl StreamSource for HttpSource {
     async fn serve(&self, _state: &AppState, headers: &HeaderMap) -> Result<Response> {
-        self.serve_inner(headers, false)
+        self.serve_with_guard(headers, None)
             .await
     }
 }
@@ -552,20 +674,8 @@ impl StreamSource for LocalSource {
 #[async_trait]
 impl StreamSource for TorrentSource {
     async fn serve(&self, state: &AppState, headers: &HeaderMap) -> Result<Response> {
-        let resolved = state
-            .ctx
-            .torrent
-            .resolve_url(&self.to_magnet())
+        self.serve_for_playback(state, headers, &[])
             .await
-            .context_bad_request("failed to resolve torrent")?;
-
-        HttpSource {
-            url: resolved,
-            request_headers: Default::default(),
-            response_headers: Default::default(),
-        }
-        .serve_inner(headers, true)
-        .await
     }
 }
 
@@ -631,8 +741,8 @@ fn extract_query_param(url: &str, param: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        HttpSource, STREAM_PROXY_CLIENT, StreamDescriptor, TrackerUrl, is_tracker_url,
-        mime_from_path,
+        HttpSource, STREAM_PROXY_CLIENT, StreamDescriptor, StreamInfo, TrackerUrl,
+        is_tracker_url, mime_from_path, parse_open_or_finite_range,
     };
     use std::path::Path;
 
@@ -713,8 +823,39 @@ mod tests {
     }
 
     #[test]
+    fn parses_open_and_finite_http_ranges() {
+        assert_eq!(parse_open_or_finite_range("bytes=10-"), Some((10, None)));
+        assert_eq!(
+            parse_open_or_finite_range("bytes=10-99"),
+            Some((10, Some(99)))
+        );
+        assert_eq!(parse_open_or_finite_range("bytes=-99"), None);
+        assert_eq!(parse_open_or_finite_range("bytes=99-10"), None);
+    }
+
+    #[test]
     fn stream_proxy_client_builds_without_panic() {
         let _ = &*STREAM_PROXY_CLIENT;
+    }
+
+    #[test]
+    fn torrent_magnet_uses_stream_filename_when_descriptor_hint_is_missing() {
+        let info = StreamInfo {
+            descriptor: StreamDescriptor::Torrent {
+                info_hash: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
+                file_hint: None,
+                file_idx: Some(4),
+                trackers: Vec::new(),
+            },
+            filename: Some("Bundle/Movie Two.mkv".to_string()),
+            ..Default::default()
+        };
+
+        let magnet = info
+            .torrent_magnet()
+            .expect("torrent magnet");
+        assert!(magnet.contains("file_idx=4"));
+        assert!(magnet.contains("file=Bundle%2FMovie%20Two.mkv"));
     }
 
     #[tokio::test]
@@ -743,7 +884,7 @@ mod tests {
         );
 
         let response = source
-            .serve_inner(&headers, true)
+            .serve_inner(&headers, true, None)
             .await
             .unwrap();
         assert_eq!(response.status(), http::StatusCode::PARTIAL_CONTENT);
@@ -783,7 +924,7 @@ mod tests {
         );
 
         let response = source
-            .serve_inner(&headers, true)
+            .serve_inner(&headers, true, None)
             .await
             .unwrap();
         assert_eq!(response.status(), http::StatusCode::OK);

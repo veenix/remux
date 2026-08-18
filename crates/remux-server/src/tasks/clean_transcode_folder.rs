@@ -83,39 +83,6 @@ impl Task for CleanTranscodeFolderTask {
         }
         info!(removed, "cleaned orphaned transcode dirs");
 
-        progress.set(50.0);
-
-        // Collect torrent IDs currently being streamed by active sessions so we
-        // don't pull the rug out from under an in-progress playback.
-        let mut active_torrent_ids = HashSet::new();
-        for session in ctx
-            .sessions
-            .get_all()
-        {
-            if let Some(tc) = session.transcode {
-                let input_url = tc
-                    .read()
-                    .await
-                    .input_url
-                    .clone();
-                if let Some(id) =
-                    crate::torrent::TorrentManager::torrent_id_from_url(&input_url)
-                {
-                    active_torrent_ids.insert(id);
-                }
-            }
-        }
-
-        let deleted = ctx
-            .torrent
-            .delete_unused_with_files(&active_torrent_ids)
-            .await
-            .unwrap_or_else(|e| {
-                warn!("failed to clean torrents: {e:#}");
-                0
-            });
-        info!(deleted, "cleaned torrent sessions");
-
         progress.set(100.0);
         Ok(())
     }

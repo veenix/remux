@@ -518,6 +518,74 @@ impl PlaybackSessionManager {
             );
     }
 
+    /// Stop and remove playback sessions from the same device before a new
+    /// video starts. This is intentionally async so stale ffmpeg processes are
+    /// actually killed instead of merely disappearing from the session map.
+    pub async fn stop_other_for_device(
+        &self,
+        device_id: &str,
+        except_play_session_id: &str,
+    ) -> Vec<String> {
+        if device_id.is_empty() {
+            return Vec::new();
+        }
+        let stale: Vec<String> = self
+            .sessions
+            .iter()
+            .filter(|entry| {
+                entry
+                    .value()
+                    .device_id
+                    == device_id
+                    && entry.key() != except_play_session_id
+            })
+            .map(|entry| {
+                entry
+                    .key()
+                    .clone()
+            })
+            .collect();
+        for id in &stale {
+            self.stop(id)
+                .await;
+        }
+        stale
+    }
+
+    /// Playback sessions that currently own a concrete stream source. HLS
+    /// stubs use the resolved TranscodeSession media_source_id; direct-play
+    /// sessions use PlaybackSession.media_source_id.
+    pub async fn playback_ids_for_media_source(&self, source_id: Uuid) -> Vec<String> {
+        let sessions = self.get_all();
+        let mut ids = Vec::new();
+        for session in sessions {
+            let direct_match = session
+                .media_source_id
+                .as_deref()
+                .and_then(|id| {
+                    id.parse::<Uuid>()
+                        .ok()
+                })
+                == Some(source_id);
+            let transcode_match = if let Some(transcode) = session
+                .transcode
+                .as_ref()
+            {
+                transcode
+                    .read()
+                    .await
+                    .media_source_id
+                    == source_id
+            } else {
+                false
+            };
+            if direct_match || transcode_match {
+                ids.push(session.play_session_id);
+            }
+        }
+        ids
+    }
+
     /// Return a clone of the session, if it exists.
     pub fn get(&self, id: &str) -> Option<PlaybackSession> {
         self.sessions

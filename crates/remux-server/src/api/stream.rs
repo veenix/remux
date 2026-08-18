@@ -8,7 +8,10 @@ use uuid::Uuid;
 use crate::{OptionExt, ResultExt};
 use axum_anyhow::ApiResult as Result;
 
-use crate::{AppState, db, stream::StreamDescriptor};
+use crate::{
+    AppState, db,
+    stream::{StreamDescriptor, TorrentSource},
+};
 
 /// Proxy any stream stored in `db::Media.stream_info` to the caller.
 ///
@@ -30,10 +33,13 @@ pub async fn stream_proxy(
     .await?
     .context_not_found("not found")?;
 
-    let descriptor = media
+    let stream_info = media
         .stream_info
-        .map(|si| si.descriptor)
         .context_not_found("media has no URL")?;
+    let fallback_file_hint = stream_info
+        .filename
+        .clone();
+    let descriptor = stream_info.descriptor;
 
     if let Some(addon_id) = descriptor.addon_id() {
         let addon = state
@@ -50,7 +56,13 @@ pub async fn stream_proxy(
             .await;
     }
 
-    if matches!(descriptor, StreamDescriptor::Torrent { .. }) {
+    if let StreamDescriptor::Torrent {
+        info_hash,
+        file_hint,
+        file_idx,
+        trackers,
+    } = &descriptor
+    {
         let cfg = db::Settings::get_config_or_default(
             &state
                 .ctx
@@ -65,6 +77,21 @@ pub async fn stream_proxy(
                 "P2P streams are disabled by the server administrator",
             );
         }
+        let playback_ids = state
+            .ctx
+            .sessions
+            .playback_ids_for_media_source(id)
+            .await;
+        return TorrentSource {
+            info_hash: info_hash.clone(),
+            file_hint: file_hint
+                .clone()
+                .or(fallback_file_hint),
+            file_idx: *file_idx,
+            trackers: trackers.clone(),
+        }
+        .serve_for_playback(&state, &headers, &playback_ids)
+        .await;
     }
 
     descriptor

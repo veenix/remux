@@ -705,13 +705,15 @@ mod auto_score_tests {
     }
 
     #[test]
-    fn auto_startup_allows_only_one_post_selection_failover() {
+    fn auto_startup_failover_is_bounded_by_session_candidate_limit() {
         let store = remux_utils::Store::new_weighted(1024);
 
-        assert!(StreamService::claim_auto_failover_slot(
-            &store,
-            "play-session"
-        ));
+        for _ in 0..StreamService::AUTO_SESSION_CANDIDATE_LIMIT - 1 {
+            assert!(StreamService::claim_auto_failover_slot(
+                &store,
+                "play-session"
+            ));
+        }
         assert!(!StreamService::claim_auto_failover_slot(
             &store,
             "play-session"
@@ -861,8 +863,8 @@ impl StreamService {
         format!("auto-failover-attempt:{play_session_id}:{candidate_id}")
     }
 
-    fn auto_failover_slot_key(play_session_id: &str) -> String {
-        format!("auto-failover-slot:{play_session_id}")
+    fn auto_failover_slot_key(play_session_id: &str, slot: usize) -> String {
+        format!("auto-failover-slot:{play_session_id}:{slot}")
     }
 
     pub(crate) fn auto_resolution(
@@ -978,18 +980,21 @@ impl StreamService {
         )
     }
 
-    /// Permit one post-selection source switch. The startup hedge has already
-    /// measured several swarms, so serially walking the whole fallback list
-    /// only turns a canceled player request into minutes of background I/O.
+    /// Reserve one post-selection source switch. Each session remains bounded
+    /// by the same candidate limit used to retain its fallback list, while a
+    /// stalled winner can continue through the alternatives already selected
+    /// for that playback.
     pub(crate) fn claim_auto_failover_slot(
         store: &remux_utils::Store,
         play_session_id: &str,
     ) -> bool {
-        store.insert(
-            Self::auto_failover_slot_key(play_session_id),
-            (),
-            Duration::from_secs(10 * 60),
-        )
+        (0..Self::AUTO_SESSION_CANDIDATE_LIMIT.saturating_sub(1)).any(|slot| {
+            store.insert(
+                Self::auto_failover_slot_key(play_session_id, slot),
+                (),
+                Duration::from_secs(10 * 60),
+            )
+        })
     }
 
     pub(crate) fn mark_auto_candidate_failed(

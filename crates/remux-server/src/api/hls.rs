@@ -1,4 +1,11 @@
-use std::sync::Arc;
+use std::{
+    collections::VecDeque,
+    sync::{
+        Arc, LazyLock,
+        atomic::{AtomicBool, AtomicU64, Ordering},
+    },
+    time::{Duration, Instant},
+};
 
 use axum::{
     body::Body,
@@ -7,13 +14,14 @@ use axum::{
 };
 use axum_anyhow::ApiResult as Result;
 use axum_extra::extract::Query;
+use futures_util::StreamExt;
 use http::{Response, StatusCode};
 use remux_macros::get;
 use tokio_util::io::ReaderStream;
 use tracing::{debug, error, info, trace, warn};
 use uuid::Uuid;
 
-use remux_sdks::remux::HardwareAccelerationType;
+use remux_sdks::remux::{HardwareAccelerationType, lang_to_two_letter};
 
 use crate::{
     AppState, IntoApiError, OptionExt, ResultExt, api, common,
@@ -24,6 +32,7 @@ use crate::{
         hw_accel,
         session::{TranscodeSession, TranscodeState},
     },
+    services::StreamService,
 };
 
 /// Serializes the lookup-or-create-transcode sequence per play_session_id so
@@ -31,6 +40,1585 @@ use crate::{
 /// ffmpeg process.
 static TRANSCODE_CREATE_LOCKS: crate::keyed_lock::KeyedLock<String> =
     crate::keyed_lock::KeyedLock::new();
+
+const HEDGE_PREFIX_BYTES: u64 = 2 * 1024 * 1024;
+const HEDGE_MIN_SAMPLE_BYTES: u64 = 512 * 1024;
+const HEDGE_STEADY_SAMPLE_BYTES: u64 = 512 * 1024;
+// Read beyond the initial startup prefix so a previously cached prefix cannot
+// satisfy the network-throughput probe by itself.
+const HEDGE_PROBE_BYTES: u64 = HEDGE_PREFIX_BYTES + HEDGE_STEADY_SAMPLE_BYTES;
+// Require enough wall-clock observation after peer warmup to distinguish
+// sustained transfer from one buffered torrent-piece burst.
+const HEDGE_MIN_STEADY_SAMPLE_TIME: Duration = Duration::from_millis(250);
+const HEDGE_PRIMARY_HEAD_START: Duration = Duration::from_secs(1);
+// The primary keeps a head start, then alternatives overlap progressively. In
+// the worst case the initial wave samples 10 MiB across four losing swarms,
+// while the fourth probe starts only if no earlier candidate proved decisive.
+const HEDGE_TERTIARY_DELAY: Duration = Duration::from_millis(1_500);
+const HEDGE_LATE_DELAY: Duration = Duration::from_secs(3);
+const HEDGE_PROBE_WINDOW: Duration = Duration::from_secs(8);
+// Jellyfin Web retries an unanswered master playlist at roughly 20 seconds.
+// Finish one server-side decision before that deadline so a client retry cannot
+// cancel and restart a second hedge for the same PlaySessionId.
+const HEDGE_TOTAL_BUDGET: Duration = Duration::from_secs(15);
+// If the fast hedge cannot find a streamable source, keep every candidate
+// connected long enough for tracker/DHT discovery and slow peers to mature.
+// Four MiB across at most twelve swarms caps the speculative patient phase at
+// 48 MiB while giving each source a full minute to prove it can move data.
+const PATIENT_PROBE_BYTES: u64 = 4 * 1024 * 1024;
+const PATIENT_PROBE_WINDOW: Duration = Duration::from_secs(60);
+const PATIENT_PROBE_CONCURRENCY: usize = 12;
+const PATIENT_SELECTION_GRACE: Duration = Duration::from_secs(1);
+const HEDGE_REQUIRED_HEADROOM: f64 = 1.35;
+const HEDGE_VIABLE_HEADROOM: f64 = 1.15;
+// Torrent pieces can arrive in a single buffered burst after a long peer
+// stall. Allow some cold-start recovery, but never let that burst alone make a
+// source look sustainable.
+const HEDGE_COLD_RECOVERY_FACTOR: f64 = 3.0;
+const HEDGE_MIN_COLD_HEADROOM: f64 = 1.0 / HEDGE_COLD_RECOVERY_FACTOR;
+const HEDGE_MIN_DEFICIT_RUNWAY: Duration = Duration::from_secs(60);
+const HEDGE_WARM_STANDBY: Duration = Duration::from_secs(60);
+const PREBUFFER_MIN_MEDIA_RUNWAY: Duration = Duration::from_secs(60);
+const PREBUFFER_RATE_GRACE: Duration = Duration::from_secs(3);
+const PREBUFFER_RATE_SAMPLE: Duration = Duration::from_secs(15);
+const PREBUFFER_THROUGHPUT_SAFETY: f64 = 0.90;
+const PREBUFFER_LOG_INTERVAL: Duration = Duration::from_secs(30);
+const PREBUFFER_PLAN_TTL: Duration = Duration::from_secs(6 * 60 * 60);
+
+static STARTUP_HEDGE_CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
+    reqwest::Client::builder()
+        .user_agent("remux-startup-hedge/1.0")
+        .connect_timeout(Duration::from_secs(2))
+        .pool_max_idle_per_host(4)
+        .build()
+        .expect("failed to build startup hedge client")
+});
+
+#[derive(Clone, Debug)]
+struct StartupProbeResult {
+    source_id: Uuid,
+    title: String,
+    range_start: u64,
+    source_size_bytes: Option<u64>,
+    bytes: u64,
+    elapsed: Duration,
+    warmup_elapsed: Option<Duration>,
+    verified_live_sample: bool,
+    required_bitrate_bps: Option<f64>,
+    error: Option<String>,
+}
+
+#[derive(Debug)]
+struct AutoPrebufferPlan {
+    source_id: Uuid,
+    range_start: u64,
+    source_size_bytes: u64,
+    required_bitrate_bps: f64,
+    remaining_duration_seconds: f64,
+    next_offset: AtomicU64,
+    estimated_goodput_bps: AtomicU64,
+    rate_trusted: AtomicBool,
+}
+
+impl AutoPrebufferPlan {
+    fn from_probe(result: &StartupProbeResult) -> Option<Self> {
+        let source_size_bytes = result.source_size_bytes?;
+        let required_bitrate_bps = result
+            .required_bitrate_bps
+            .filter(|bitrate| *bitrate > 0.0)?;
+        let next_offset = result
+            .range_start
+            .saturating_add(result.bytes)
+            .min(source_size_bytes);
+        let remaining_bytes = source_size_bytes.saturating_sub(result.range_start);
+        let remaining_duration_seconds =
+            remaining_bytes as f64 * 8.0 / required_bitrate_bps;
+
+        Some(Self {
+            source_id: result.source_id,
+            range_start: result.range_start,
+            source_size_bytes,
+            required_bitrate_bps,
+            remaining_duration_seconds,
+            next_offset: AtomicU64::new(next_offset),
+            estimated_goodput_bps: AtomicU64::new(
+                result
+                    .goodput_bps()
+                    .to_bits(),
+            ),
+            // The short hedge proves that bytes are moving, but a longer
+            // uncached sample is required before deciding how much runway is
+            // safe for the rest of the movie.
+            rate_trusted: AtomicBool::new(false),
+        })
+    }
+
+    fn remaining_bytes(&self) -> u64 {
+        self.source_size_bytes
+            .saturating_sub(self.range_start)
+    }
+
+    fn downloaded_bytes(&self) -> u64 {
+        self.next_offset
+            .load(Ordering::Relaxed)
+            .saturating_sub(self.range_start)
+            .min(self.remaining_bytes())
+    }
+
+    fn estimated_goodput_bps(&self) -> f64 {
+        f64::from_bits(
+            self.estimated_goodput_bps
+                .load(Ordering::Relaxed),
+        )
+    }
+
+    fn target_bytes(&self) -> u64 {
+        let remaining_bytes = self.remaining_bytes();
+        if !self
+            .rate_trusted
+            .load(Ordering::Relaxed)
+        {
+            return remaining_bytes;
+        }
+
+        let safe_goodput = self.estimated_goodput_bps() * PREBUFFER_THROUGHPUT_SAFETY;
+        let deficit_bps = (self.required_bitrate_bps - safe_goodput).max(0.0);
+        let deficit_buffer =
+            (deficit_bps * self.remaining_duration_seconds / 8.0).ceil() as u64;
+        let minimum_runway = (self.required_bitrate_bps
+            * PREBUFFER_MIN_MEDIA_RUNWAY.as_secs_f64()
+            / 8.0)
+            .ceil() as u64;
+
+        deficit_buffer
+            .max(minimum_runway)
+            .min(remaining_bytes)
+    }
+}
+
+impl StartupProbeResult {
+    fn cold_goodput_bps(&self) -> f64 {
+        self.bytes as f64 * 8.0
+            / self
+                .elapsed
+                .as_secs_f64()
+                .max(0.001)
+    }
+
+    fn goodput_bps(&self) -> f64 {
+        let steady_bytes = self
+            .bytes
+            .saturating_sub(HEDGE_PREFIX_BYTES);
+        if steady_bytes >= HEDGE_STEADY_SAMPLE_BYTES {
+            if let Some(warmup_elapsed) = self.warmup_elapsed {
+                let steady_elapsed = self
+                    .elapsed
+                    .saturating_sub(warmup_elapsed);
+                if self.verified_live_sample
+                    || steady_elapsed >= HEDGE_MIN_STEADY_SAMPLE_TIME
+                {
+                    return steady_bytes as f64 * 8.0
+                        / steady_elapsed
+                            .as_secs_f64()
+                            .max(0.001);
+                }
+            }
+        }
+        self.cold_goodput_bps()
+    }
+
+    fn headroom(&self) -> Option<f64> {
+        self.required_bitrate_bps
+            .filter(|required| *required > 0.0)
+            .map(|required| self.goodput_bps() / required)
+    }
+
+    fn cold_headroom(&self) -> Option<f64> {
+        self.required_bitrate_bps
+            .filter(|required| *required > 0.0)
+            .map(|required| self.cold_goodput_bps() / required)
+    }
+
+    fn effective_goodput_bps(&self) -> f64 {
+        self.goodput_bps()
+            .min(self.cold_goodput_bps() * HEDGE_COLD_RECOVERY_FACTOR)
+    }
+
+    fn effective_headroom(&self) -> Option<f64> {
+        self.required_bitrate_bps
+            .filter(|required| *required > 0.0)
+            .map(|required| self.effective_goodput_bps() / required)
+    }
+
+    fn is_strong(&self) -> bool {
+        self.bytes >= HEDGE_PROBE_BYTES
+            && !self.sample_is_inconclusive()
+            && self
+                .headroom()
+                .is_some_and(|headroom| headroom >= HEDGE_REQUIRED_HEADROOM)
+            && self
+                .cold_headroom()
+                .is_some_and(|headroom| headroom >= HEDGE_MIN_COLD_HEADROOM)
+    }
+
+    fn is_viable(&self) -> bool {
+        self.bytes >= HEDGE_PROBE_BYTES
+            && !self.sample_is_inconclusive()
+            && self
+                .headroom()
+                .is_some_and(|headroom| headroom >= HEDGE_VIABLE_HEADROOM)
+            && self
+                .cold_headroom()
+                .is_some_and(|headroom| headroom >= HEDGE_MIN_COLD_HEADROOM)
+    }
+
+    fn is_decisive(&self) -> bool {
+        self.is_strong() || self.is_viable()
+    }
+
+    fn is_stalled(&self) -> bool {
+        self.bytes < HEDGE_MIN_SAMPLE_BYTES
+    }
+
+    fn sample_is_inconclusive(&self) -> bool {
+        self.bytes >= HEDGE_PROBE_BYTES
+            && !self.verified_live_sample
+            && self.elapsed < HEDGE_MIN_STEADY_SAMPLE_TIME
+    }
+
+    fn deficit_runway(&self) -> Option<Duration> {
+        let required = self
+            .required_bitrate_bps
+            .filter(|required| *required > 0.0)?;
+        let deficit = required - self.effective_goodput_bps();
+        (deficit > 0.0)
+            .then(|| Duration::from_secs_f64(self.bytes as f64 * 8.0 / deficit))
+    }
+
+    fn is_unsustainable(&self) -> bool {
+        self.is_stalled()
+            || self.sample_is_inconclusive()
+            || self
+                .deficit_runway()
+                .is_some_and(|runway| runway < HEDGE_MIN_DEFICIT_RUNWAY)
+    }
+}
+
+fn auto_prebuffer_plan_key(play_session_id: &str) -> String {
+    format!("auto-prebuffer:{play_session_id}")
+}
+
+fn auto_prebuffer_plan(
+    state: &AppState,
+    play_session_id: &str,
+) -> Option<Arc<AutoPrebufferPlan>> {
+    state
+        .ctx
+        .store
+        .get(auto_prebuffer_plan_key(play_session_id))
+}
+
+fn save_auto_prebuffer_plan(
+    state: &AppState,
+    play_session_id: &str,
+    result: &StartupProbeResult,
+) -> Option<Arc<AutoPrebufferPlan>> {
+    let plan = Arc::new(AutoPrebufferPlan::from_probe(result)?);
+    state
+        .ctx
+        .store
+        .save_arc_with_weight(
+            auto_prebuffer_plan_key(play_session_id),
+            plan.clone(),
+            1,
+            PREBUFFER_PLAN_TTL,
+        );
+    Some(plan)
+}
+
+fn clear_auto_prebuffer_plan(state: &AppState, play_session_id: &str) {
+    state
+        .ctx
+        .store
+        .delete(auto_prebuffer_plan_key(play_session_id));
+}
+
+fn retain_prebuffer_candidate(
+    candidates: &mut Vec<(db::Media, StartupProbeResult)>,
+    candidate: &db::Media,
+    result: &StartupProbeResult,
+) -> bool {
+    if !can_prebuffer_probe(result) {
+        return false;
+    }
+    candidates.push((candidate.clone(), result.clone()));
+    true
+}
+
+fn can_prebuffer_probe(result: &StartupProbeResult) -> bool {
+    result.bytes >= HEDGE_PROBE_BYTES
+        && result.goodput_bps() > 0.0
+        && AutoPrebufferPlan::from_probe(result).is_some()
+}
+
+async fn prebuffer_auto_source(
+    state: &AppState,
+    play_session_id: &str,
+    media: &db::Media,
+    plan: Arc<AutoPrebufferPlan>,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        plan.source_id == media.id,
+        "Auto prebuffer source changed unexpectedly"
+    );
+
+    let url = format!(
+        "http://127.0.0.1:{}/stream/{}",
+        state
+            .ctx
+            .config
+            .port,
+        media.id
+    );
+    let mut next_offset = plan
+        .next_offset
+        .load(Ordering::Relaxed);
+    if next_offset >= plan.source_size_bytes {
+        return Ok(());
+    }
+
+    info!(
+        %play_session_id,
+        source_id = %media.id,
+        source_title = %media.title,
+        downloaded_bytes = plan.downloaded_bytes(),
+        source_bytes = plan.remaining_bytes(),
+        initial_goodput_mbps = plan.estimated_goodput_bps() / 1_000_000.0,
+        required_mbps = plan.required_bitrate_bps / 1_000_000.0,
+        "Auto source needs prebuffering before playback"
+    );
+    let response = STARTUP_HEDGE_CLIENT
+        .get(&url)
+        .header(http::header::RANGE, format!("bytes={next_offset}-"))
+        .send()
+        .await?
+        .error_for_status()?;
+    anyhow::ensure!(
+        response.status() == StatusCode::PARTIAL_CONTENT,
+        "Auto prebuffer server ignored byte range at offset {next_offset}"
+    );
+    if let Some(actual_size) = response_total_size(response.headers()) {
+        anyhow::ensure!(
+            actual_size == plan.source_size_bytes,
+            "Auto prebuffer source size changed from {} to {} bytes",
+            plan.source_size_bytes,
+            actual_size
+        );
+    }
+
+    let request_started = Instant::now();
+    let mut rate_window_started = request_started + PREBUFFER_RATE_GRACE;
+    let mut rate_window_bytes = 0u64;
+    let mut last_log = Instant::now();
+    let mut stream = response.bytes_stream();
+    while let Some(chunk) = stream
+        .next()
+        .await
+    {
+        let chunk = chunk?;
+        let accepted = (chunk.len() as u64).min(
+            plan.source_size_bytes
+                .saturating_sub(next_offset),
+        );
+        if accepted == 0 {
+            break;
+        }
+        next_offset = next_offset.saturating_add(accepted);
+        plan.next_offset
+            .store(next_offset, Ordering::Relaxed);
+
+        let now = Instant::now();
+        if now >= rate_window_started {
+            rate_window_bytes = rate_window_bytes.saturating_add(accepted);
+            let sample_elapsed = now.saturating_duration_since(rate_window_started);
+            if sample_elapsed >= PREBUFFER_RATE_SAMPLE {
+                let observed_bps = rate_window_bytes as f64 * 8.0
+                    / sample_elapsed
+                        .as_secs_f64()
+                        .max(0.001);
+                let estimate = if plan
+                    .rate_trusted
+                    .load(Ordering::Relaxed)
+                {
+                    plan.estimated_goodput_bps() * 0.70 + observed_bps * 0.30
+                } else {
+                    observed_bps
+                };
+                plan.estimated_goodput_bps
+                    .store(estimate.to_bits(), Ordering::Relaxed);
+                plan.rate_trusted
+                    .store(true, Ordering::Relaxed);
+                rate_window_started = now;
+                rate_window_bytes = 0;
+            }
+        }
+
+        let downloaded_bytes = plan.downloaded_bytes();
+        let target_bytes = plan.target_bytes();
+        if last_log.elapsed() >= PREBUFFER_LOG_INTERVAL {
+            let estimated_bps = plan.estimated_goodput_bps();
+            let remaining_to_target = target_bytes.saturating_sub(downloaded_bytes);
+            let estimated_wait_seconds = (estimated_bps > 0.0)
+                .then(|| remaining_to_target as f64 * 8.0 / estimated_bps);
+            info!(
+                %play_session_id,
+                source_id = %media.id,
+                downloaded_bytes,
+                target_bytes,
+                source_bytes = plan.remaining_bytes(),
+                estimated_goodput_mbps = estimated_bps / 1_000_000.0,
+                required_mbps = plan.required_bitrate_bps / 1_000_000.0,
+                estimated_wait_seconds,
+                rate_trusted = plan.rate_trusted.load(Ordering::Relaxed),
+                "Auto prebuffer progress"
+            );
+            last_log = now;
+        }
+
+        if downloaded_bytes >= plan.remaining_bytes()
+            || (plan
+                .rate_trusted
+                .load(Ordering::Relaxed)
+                && downloaded_bytes >= target_bytes)
+        {
+            info!(
+                %play_session_id,
+                source_id = %media.id,
+                downloaded_bytes,
+                target_bytes,
+                source_bytes = plan.remaining_bytes(),
+                estimated_goodput_mbps = plan.estimated_goodput_bps() / 1_000_000.0,
+                required_mbps = plan.required_bitrate_bps / 1_000_000.0,
+                "Auto prebuffer reached safe playback runway"
+            );
+            return Ok(());
+        }
+    }
+
+    anyhow::bail!(
+        "Auto prebuffer ended after {} of {} bytes",
+        plan.downloaded_bytes(),
+        plan.target_bytes()
+    )
+}
+
+fn average_bitrate_bps(size_bytes: i64, duration_seconds: f64) -> Option<f64> {
+    (size_bytes > 0 && duration_seconds > 0.0)
+        .then_some(size_bytes as f64 * 8.0 / duration_seconds)
+}
+
+fn media_duration_seconds(media: &db::Media) -> Option<f64> {
+    media
+        .probe_data
+        .as_ref()
+        .and_then(|probe| probe.run_time_ticks)
+        .filter(|ticks| *ticks > 0)
+        .map(|ticks| ticks as f64 / 10_000_000.0)
+        .or_else(|| {
+            media
+                .runtime
+                .filter(|seconds| *seconds > 0)
+                .map(|seconds| seconds as f64)
+        })
+        .or_else(|| {
+            media
+                .stream_info
+                .as_ref()
+                .and_then(|info| info.duration)
+                .filter(|seconds| *seconds > 0)
+                .map(|seconds| seconds as f64)
+        })
+}
+
+fn required_source_bitrate_bps(
+    media: &db::Media,
+    fallback_duration_seconds: Option<f64>,
+    observed_size_bytes: Option<u64>,
+) -> Option<f64> {
+    if let Some(bitrate) = media
+        .probe_data
+        .as_ref()
+        .and_then(|probe| probe.bitrate)
+        .filter(|bitrate| *bitrate > 0)
+    {
+        return Some(bitrate as f64);
+    }
+
+    let size = observed_size_bytes
+        .and_then(|size| i64::try_from(size).ok())
+        .or_else(|| {
+            media
+                .probe_data
+                .as_ref()
+                .and_then(|probe| probe.size)
+        })
+        .or_else(|| {
+            media
+                .stream_info
+                .as_ref()
+                .and_then(|info| info.size)
+        })?;
+    let duration_seconds =
+        media_duration_seconds(media).or(fallback_duration_seconds)?;
+    average_bitrate_bps(size, duration_seconds)
+}
+
+fn startup_probe_range_start(
+    media: &db::Media,
+    fallback_duration_seconds: Option<f64>,
+    start_time_ticks: Option<i64>,
+) -> u64 {
+    let Some(start_time_ticks) = start_time_ticks.filter(|ticks| *ticks > 0) else {
+        return 0;
+    };
+    let Some(duration_seconds) =
+        media_duration_seconds(media).or(fallback_duration_seconds)
+    else {
+        return 0;
+    };
+    let Some(size_bytes) = media
+        .probe_data
+        .as_ref()
+        .and_then(|probe| probe.size)
+        .or_else(|| {
+            media
+                .stream_info
+                .as_ref()
+                .and_then(|info| info.size)
+        })
+        .filter(|size| *size > HEDGE_PROBE_BYTES as i64)
+    else {
+        return 0;
+    };
+
+    startup_probe_range_start_for_size(
+        size_bytes as u64,
+        duration_seconds,
+        start_time_ticks,
+    )
+}
+
+fn startup_probe_range_start_for_size(
+    size_bytes: u64,
+    duration_seconds: f64,
+    start_time_ticks: i64,
+) -> u64 {
+    if size_bytes <= HEDGE_PROBE_BYTES || duration_seconds <= 0.0 {
+        return 0;
+    }
+    let start_seconds = start_time_ticks.max(0) as f64 / 10_000_000.0;
+    let fraction = (start_seconds / duration_seconds).clamp(0.0, 1.0);
+    let estimated_offset = (size_bytes as f64 * fraction) as u64;
+    estimated_offset.min(size_bytes.saturating_sub(HEDGE_PROBE_BYTES))
+}
+
+fn cache_bust_probe_range_start(
+    source_size_bytes: u64,
+    startup_range_start: u64,
+) -> Option<u64> {
+    let max_start = source_size_bytes.checked_sub(HEDGE_STEADY_SAMPLE_BYTES)?;
+    let slots = max_start.checked_add(1)?;
+    let nonce = common::get_uuid().as_u128() as u64;
+    let mut candidate = nonce % slots;
+    let startup_end = startup_range_start.saturating_add(HEDGE_PROBE_BYTES);
+    let candidate_end = candidate.saturating_add(HEDGE_STEADY_SAMPLE_BYTES);
+    let overlaps_startup =
+        candidate < startup_end && candidate_end > startup_range_start;
+    if overlaps_startup {
+        if startup_end <= max_start {
+            candidate = startup_end;
+        } else if startup_range_start >= HEDGE_STEADY_SAMPLE_BYTES {
+            candidate = startup_range_start - HEDGE_STEADY_SAMPLE_BYTES;
+        } else {
+            return None;
+        }
+    }
+    Some(candidate)
+}
+
+fn response_total_size(headers: &http::HeaderMap) -> Option<u64> {
+    headers
+        .get(http::header::CONTENT_RANGE)?
+        .to_str()
+        .ok()?
+        .rsplit_once('/')?
+        .1
+        .parse()
+        .ok()
+}
+
+async fn probe_torrent_prefix(
+    port: u16,
+    media: db::Media,
+    window: Duration,
+    probe_bytes: u64,
+    fallback_duration_seconds: Option<f64>,
+    start_time_ticks: Option<i64>,
+) -> StartupProbeResult {
+    let started = Instant::now();
+    let mut bytes = 0u64;
+    let mut warmup_elapsed = None;
+    let mut verified_live_sample = false;
+    let mut range_start =
+        startup_probe_range_start(&media, fallback_duration_seconds, start_time_ticks);
+    let mut source_size_bytes = None;
+    let url = format!("http://127.0.0.1:{port}/stream/{}", media.id);
+    let outcome = tokio::time::timeout(window, async {
+        let send_range = |range_start: u64, length: u64| {
+            STARTUP_HEDGE_CLIENT
+                .get(&url)
+                .header(
+                    http::header::RANGE,
+                    format!(
+                        "bytes={range_start}-{}",
+                        range_start.saturating_add(length - 1)
+                    ),
+                )
+                .send()
+        };
+        let mut response = send_range(range_start, probe_bytes).await?;
+        source_size_bytes = response_total_size(response.headers());
+
+        // Provider metadata may omit size or report a whole bundle. The stream
+        // response knows the exact selected-file length, so correct a resumed
+        // probe before downloading its sample.
+        if let (Some(size_bytes), Some(start_time_ticks), Some(duration_seconds)) = (
+            source_size_bytes,
+            start_time_ticks.filter(|ticks| *ticks > 0),
+            media_duration_seconds(&media).or(fallback_duration_seconds),
+        ) {
+            let corrected_range_start = startup_probe_range_start_for_size(
+                size_bytes,
+                duration_seconds,
+                start_time_ticks,
+            );
+            if corrected_range_start != range_start {
+                range_start = corrected_range_start;
+                response = send_range(range_start, probe_bytes).await?;
+                source_size_bytes =
+                    response_total_size(response.headers()).or(source_size_bytes);
+            }
+        }
+        let response = response.error_for_status()?;
+        let mut stream = response.bytes_stream();
+        while let Some(chunk) = stream
+            .next()
+            .await
+        {
+            let chunk = chunk?;
+            bytes = bytes.saturating_add(chunk.len() as u64);
+            if warmup_elapsed.is_none() && bytes >= HEDGE_PREFIX_BYTES {
+                warmup_elapsed = Some(started.elapsed());
+            }
+            if bytes >= probe_bytes {
+                break;
+            }
+        }
+
+        // A complete prefix that arrives almost instantly may be entirely
+        // cached from an earlier attempt. Verify current swarm throughput at a
+        // random, non-overlapping file offset before calling it sustainable.
+        if bytes >= probe_bytes && started.elapsed() < HEDGE_MIN_STEADY_SAMPLE_TIME {
+            if let Some(live_range_start) = source_size_bytes
+                .and_then(|size| cache_bust_probe_range_start(size, range_start))
+            {
+                bytes = HEDGE_PREFIX_BYTES;
+                warmup_elapsed = Some(started.elapsed());
+                verified_live_sample = true;
+                let response = send_range(live_range_start, HEDGE_STEADY_SAMPLE_BYTES)
+                    .await?
+                    .error_for_status()?;
+                let mut live_bytes = 0u64;
+                let mut stream = response.bytes_stream();
+                while let Some(chunk) = stream
+                    .next()
+                    .await
+                {
+                    let chunk = chunk?;
+                    live_bytes = live_bytes.saturating_add(chunk.len() as u64);
+                    if live_bytes >= HEDGE_STEADY_SAMPLE_BYTES {
+                        break;
+                    }
+                }
+                bytes = HEDGE_PREFIX_BYTES
+                    .saturating_add(live_bytes.min(HEDGE_STEADY_SAMPLE_BYTES));
+            }
+        }
+        Ok::<(), anyhow::Error>(())
+    })
+    .await;
+    let error = match outcome {
+        Ok(Ok(())) => None,
+        Ok(Err(error)) => Some(error.to_string()),
+        Err(_) => Some("probe timed out".to_string()),
+    };
+    StartupProbeResult {
+        source_id: media.id,
+        title: media
+            .title
+            .clone(),
+        range_start,
+        source_size_bytes,
+        bytes,
+        elapsed: started.elapsed(),
+        warmup_elapsed,
+        verified_live_sample,
+        required_bitrate_bps: required_source_bitrate_bps(
+            &media,
+            fallback_duration_seconds,
+            source_size_bytes,
+        ),
+        error,
+    }
+}
+
+fn log_startup_probe(role: &str, result: &StartupProbeResult) {
+    info!(
+        role,
+        source_id = %result.source_id,
+        title = %result.title,
+        range_start = result.range_start,
+        source_size_bytes = result.source_size_bytes,
+        bytes = result.bytes,
+        elapsed_ms = result.elapsed.as_millis() as u64,
+        warmup_ms = result.warmup_elapsed.map(|elapsed| elapsed.as_millis() as u64),
+        verified_live_sample = result.verified_live_sample,
+        cold_goodput_mbps = result.cold_goodput_bps() / 1_000_000.0,
+        goodput_mbps = result.goodput_bps() / 1_000_000.0,
+        required_mbps = result.required_bitrate_bps.map(|bitrate| bitrate / 1_000_000.0),
+        headroom = result.headroom(),
+        cold_headroom = result.cold_headroom(),
+        effective_headroom = result.effective_headroom(),
+        deficit_runway_secs = result.deficit_runway().map(|runway| runway.as_secs_f64()),
+        strong = result.is_strong(),
+        viable = result.is_viable(),
+        stalled = result.is_stalled(),
+        error = ?result.error,
+        "Auto startup hedge probe"
+    );
+}
+
+async fn probe_patient_candidates(
+    port: u16,
+    candidates: &[db::Media],
+    fallback_duration_seconds: Option<f64>,
+    start_time_ticks: Option<i64>,
+) -> Vec<(db::Media, StartupProbeResult)> {
+    let mut probes = futures_util::stream::iter(
+        candidates
+            .iter()
+            .cloned()
+            .map(|candidate| async move {
+                let result = probe_torrent_prefix(
+                    port,
+                    candidate.clone(),
+                    PATIENT_PROBE_WINDOW,
+                    PATIENT_PROBE_BYTES,
+                    fallback_duration_seconds,
+                    start_time_ticks,
+                )
+                .await;
+                log_startup_probe("patient", &result);
+                (candidate, result)
+            }),
+    )
+    .buffer_unordered(PATIENT_PROBE_CONCURRENCY);
+    let mut results = Vec::new();
+    let mut selection_deadline: Option<Instant> = None;
+
+    loop {
+        let next = if let Some(deadline) = selection_deadline {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            match tokio::time::timeout(remaining, probes.next()).await {
+                Ok(next) => next,
+                Err(_) => break,
+            }
+        } else {
+            probes
+                .next()
+                .await
+        };
+        let Some((candidate, result)) = next else {
+            break;
+        };
+        let decisive = result.is_decisive();
+        if selection_deadline.is_none() && can_prebuffer_probe(&result) {
+            selection_deadline = Some(Instant::now() + PATIENT_SELECTION_GRACE);
+        }
+        results.push((candidate, result));
+        if decisive {
+            break;
+        }
+    }
+
+    results
+}
+
+fn prefer_backup_probe(
+    primary: &StartupProbeResult,
+    backup: &StartupProbeResult,
+) -> bool {
+    let (primary_score, backup_score) =
+        match (primary.effective_headroom(), backup.effective_headroom()) {
+            (Some(primary), Some(backup)) => (primary, backup),
+            _ => (
+                primary.effective_goodput_bps(),
+                backup.effective_goodput_bps(),
+            ),
+        };
+    backup_score > primary_score * 1.10
+}
+
+fn preferred_probe_index(results: &[&StartupProbeResult]) -> usize {
+    let mut preferred = 0;
+    for candidate in 1..results.len() {
+        if prefer_backup_probe(results[preferred], results[candidate]) {
+            preferred = candidate;
+        }
+    }
+    preferred
+}
+
+fn prefer_patient_probe(
+    primary: &StartupProbeResult,
+    backup: &StartupProbeResult,
+) -> bool {
+    let (primary_score, backup_score) = match (primary.headroom(), backup.headroom()) {
+        (Some(primary), Some(backup)) => (primary, backup),
+        _ => (primary.goodput_bps(), backup.goodput_bps()),
+    };
+    backup_score > primary_score * 1.10
+}
+
+fn preferred_patient_probe_index(results: &[&StartupProbeResult]) -> usize {
+    let mut preferred = 0;
+    for candidate in 1..results.len() {
+        if prefer_patient_probe(results[preferred], results[candidate]) {
+            preferred = candidate;
+        }
+    }
+    preferred
+}
+
+fn schedule_warm_standby_cleanup(
+    state: &AppState,
+    play_session_id: &str,
+    loser: &db::Media,
+) {
+    let Some(info_hash) = loser
+        .stream_info
+        .as_ref()
+        .and_then(|info| {
+            info.descriptor
+                .torrent_info_hash()
+        })
+        .map(str::to_owned)
+    else {
+        return;
+    };
+    let ctx = state
+        .ctx
+        .clone();
+    let play_session_id = play_session_id.to_string();
+    let source_id = loser.id;
+    tokio::spawn(async move {
+        tokio::time::sleep(HEDGE_WARM_STANDBY).await;
+        if StreamService::auto_session_choice(&ctx.store, &play_session_id)
+            .is_some_and(|choice| choice.winner_id == source_id)
+        {
+            debug!(
+                %play_session_id,
+                %source_id,
+                "keeping Auto warm standby because it became the active winner"
+            );
+            return;
+        }
+        match ctx
+            .torrent
+            .discard_warm_standby_if_unwatched(&ctx.db, source_id, &info_hash)
+            .await
+        {
+            Ok(true) => {}
+            Ok(false) => debug!(
+                %play_session_id,
+                %source_id,
+                "kept or already removed Auto warm standby"
+            ),
+            Err(error) => warn!(
+                %play_session_id,
+                %source_id,
+                %error,
+                "failed to clean up Auto warm standby"
+            ),
+        }
+    });
+}
+
+fn schedule_failed_probe_cleanup(state: &AppState, candidate: &db::Media) {
+    let Some(info_hash) = candidate
+        .stream_info
+        .as_ref()
+        .and_then(|info| {
+            info.descriptor
+                .torrent_info_hash()
+        })
+        .map(str::to_owned)
+    else {
+        return;
+    };
+    let ctx = state
+        .ctx
+        .clone();
+    let source_id = candidate.id;
+    tokio::spawn(async move {
+        match ctx
+            .torrent
+            .discard_warm_standby_if_unwatched(&ctx.db, source_id, &info_hash)
+            .await
+        {
+            Ok(true) => {}
+            Ok(false) => debug!(
+                %source_id,
+                "kept or already removed failed Auto startup probe"
+            ),
+            Err(error) => warn!(
+                %source_id,
+                %error,
+                "failed to clean up failed Auto startup probe"
+            ),
+        }
+    });
+}
+
+async fn maybe_hedge_auto_startup(
+    state: &AppState,
+    play_session_id: &str,
+    primary: db::Media,
+    start_time_ticks: Option<i64>,
+) -> anyhow::Result<db::Media> {
+    let Some(choice) = StreamService::auto_session_choice(
+        &state
+            .ctx
+            .store,
+        play_session_id,
+    ) else {
+        return Ok(primary);
+    };
+    if choice.winner_id != primary.id {
+        return Ok(primary);
+    }
+    if let Some(plan) = auto_prebuffer_plan(state, play_session_id) {
+        if plan.source_id == primary.id {
+            prebuffer_auto_source(state, play_session_id, &primary, plan).await?;
+            clear_auto_prebuffer_plan(state, play_session_id);
+            return Ok(primary);
+        }
+        clear_auto_prebuffer_plan(state, play_session_id);
+    }
+    let primary_hash = primary
+        .stream_info
+        .as_ref()
+        .and_then(|info| {
+            info.descriptor
+                .torrent_info_hash()
+        });
+    let Some(primary_hash) = primary_hash else {
+        return Ok(primary);
+    };
+    if state
+        .ctx
+        .torrent
+        .managed_availability(primary_hash)
+        .is_some_and(|availability| availability.finished)
+    {
+        clear_auto_prebuffer_plan(state, play_session_id);
+        return Ok(primary);
+    }
+
+    let mut fallbacks = VecDeque::new();
+    for fallback_id in choice
+        .fallback_ids
+        .iter()
+        .copied()
+        .filter(|fallback_id| *fallback_id != primary.id)
+    {
+        match db::Media::get_by_id(
+            &state
+                .ctx
+                .db,
+            &fallback_id,
+        )
+        .await
+        {
+            Ok(Some(fallback))
+                if fallback
+                    .stream_info
+                    .as_ref()
+                    .is_some_and(|info| info.is_p2p())
+                    && !StreamService::is_auto_candidate_failed(
+                        &state
+                            .ctx
+                            .store,
+                        choice.item_id,
+                        &choice.resolution,
+                        &fallback,
+                    ) =>
+            {
+                fallbacks.push_back(fallback);
+            }
+            Ok(_) => {}
+            Err(error) => warn!(
+                %play_session_id,
+                %fallback_id,
+                %error,
+                "failed to load Auto hedge fallback"
+            ),
+        }
+    }
+    let Some(backup) = fallbacks.pop_front() else {
+        return Ok(primary);
+    };
+    let tertiary = fallbacks.pop_front();
+    let late = fallbacks.pop_front();
+    let patient_candidates = std::iter::once(primary.clone())
+        .chain(std::iter::once(backup.clone()))
+        .chain(
+            tertiary
+                .iter()
+                .cloned(),
+        )
+        .chain(
+            late.iter()
+                .cloned(),
+        )
+        .chain(
+            fallbacks
+                .iter()
+                .cloned(),
+        )
+        .collect::<Vec<_>>();
+    let mark_failed = |candidate: &db::Media| {
+        StreamService::mark_auto_candidate_failed(
+            &state
+                .ctx
+                .store,
+            choice.item_id,
+            &choice.resolution,
+            candidate,
+        );
+        schedule_failed_probe_cleanup(state, candidate);
+    };
+    let finalize_selection =
+        |selected: db::Media,
+         standbys: Vec<db::Media>,
+         remaining: &VecDeque<db::Media>| {
+            let mut fallback_ids = standbys
+                .iter()
+                .map(|candidate| candidate.id)
+                .collect::<Vec<_>>();
+            fallback_ids.extend(
+                remaining
+                    .iter()
+                    .map(|candidate| candidate.id),
+            );
+            StreamService::update_auto_session_choice(
+                &state
+                    .ctx
+                    .store,
+                play_session_id,
+                selected.id,
+                fallback_ids,
+            );
+            StreamService::remember_auto_choice(
+                &state
+                    .ctx
+                    .store,
+                choice.item_id,
+                &choice.resolution,
+                selected.id,
+            );
+            for standby in &standbys {
+                schedule_warm_standby_cleanup(state, play_session_id, standby);
+            }
+            info!(
+                %play_session_id,
+                winner_id = %selected.id,
+                winner_title = %selected.title,
+                standby_ids = ?standbys.iter().map(|candidate| candidate.id).collect::<Vec<_>>(),
+                standby_titles = ?standbys.iter().map(|candidate| candidate.title.as_str()).collect::<Vec<_>>(),
+                remaining_fallbacks = remaining.len(),
+                warm_standby_secs = HEDGE_WARM_STANDBY.as_secs(),
+                "Auto startup hedge selected winner"
+            );
+            selected
+        };
+    let item_duration_seconds = match db::Media::get_by_id(
+        &state
+            .ctx
+            .db,
+        &choice.item_id,
+    )
+    .await
+    {
+        Ok(Some(item)) => media_duration_seconds(&item),
+        Ok(None) => None,
+        Err(error) => {
+            debug!(
+                %play_session_id,
+                item_id = %choice.item_id,
+                %error,
+                "could not load item duration for startup bitrate estimate"
+            );
+            None
+        }
+    };
+    let hedge_started = Instant::now();
+
+    info!(
+        %play_session_id,
+        primary_id = %primary.id,
+        backup_id = %backup.id,
+        tertiary_id = ?tertiary.as_ref().map(|candidate| candidate.id),
+        late_id = ?late.as_ref().map(|candidate| candidate.id),
+        remaining_fallbacks = fallbacks.len(),
+        head_start_ms = HEDGE_PRIMARY_HEAD_START.as_millis() as u64,
+        tertiary_delay_ms = HEDGE_TERTIARY_DELAY.as_millis() as u64,
+        late_delay_ms = HEDGE_LATE_DELAY.as_millis() as u64,
+        probe_bytes = HEDGE_PROBE_BYTES,
+        total_budget_ms = HEDGE_TOTAL_BUDGET.as_millis() as u64,
+        "starting bounded Auto startup hedge"
+    );
+    let mut primary_probe = Box::pin(probe_torrent_prefix(
+        state
+            .ctx
+            .config
+            .port,
+        primary.clone(),
+        HEDGE_PROBE_WINDOW,
+        HEDGE_PROBE_BYTES,
+        item_duration_seconds,
+        start_time_ticks,
+    ));
+    let mut primary_result = None;
+    tokio::select! {
+        result = &mut primary_probe => {
+            log_startup_probe("primary", &result);
+            primary_result = Some(result);
+        }
+        _ = tokio::time::sleep(HEDGE_PRIMARY_HEAD_START) => {}
+    }
+    if primary_result
+        .as_ref()
+        .is_some_and(StartupProbeResult::is_decisive)
+    {
+        return Ok(primary);
+    }
+
+    let mut backup_probe = Box::pin(probe_torrent_prefix(
+        state
+            .ctx
+            .config
+            .port,
+        backup.clone(),
+        HEDGE_PROBE_WINDOW,
+        HEDGE_PROBE_BYTES,
+        item_duration_seconds,
+        start_time_ticks,
+    ));
+    let tertiary_candidate = tertiary.clone();
+    let tertiary_delay = HEDGE_TERTIARY_DELAY.saturating_sub(hedge_started.elapsed());
+    let port = state
+        .ctx
+        .config
+        .port;
+    let mut tertiary_probe = Box::pin(async move {
+        if let Some(candidate) = tertiary_candidate {
+            tokio::time::sleep(tertiary_delay).await;
+            Some(
+                probe_torrent_prefix(
+                    port,
+                    candidate,
+                    HEDGE_PROBE_WINDOW,
+                    HEDGE_PROBE_BYTES,
+                    item_duration_seconds,
+                    start_time_ticks,
+                )
+                .await,
+            )
+        } else {
+            std::future::pending::<Option<StartupProbeResult>>().await
+        }
+    });
+    let late_candidate = late.clone();
+    let late_delay = HEDGE_LATE_DELAY.saturating_sub(hedge_started.elapsed());
+    let mut late_probe = Box::pin(async move {
+        if let Some(candidate) = late_candidate {
+            tokio::time::sleep(late_delay).await;
+            Some(
+                probe_torrent_prefix(
+                    port,
+                    candidate,
+                    HEDGE_PROBE_WINDOW,
+                    HEDGE_PROBE_BYTES,
+                    item_duration_seconds,
+                    start_time_ticks,
+                )
+                .await,
+            )
+        } else {
+            std::future::pending::<Option<StartupProbeResult>>().await
+        }
+    });
+    let mut backup_result = None;
+    let mut tertiary_result = None;
+    let mut late_result = None;
+    let selected_index = loop {
+        if primary_result
+            .as_ref()
+            .is_some_and(StartupProbeResult::is_decisive)
+        {
+            break Some(0);
+        }
+        if backup_result
+            .as_ref()
+            .is_some_and(StartupProbeResult::is_decisive)
+        {
+            break Some(1);
+        }
+        if tertiary_result
+            .as_ref()
+            .is_some_and(StartupProbeResult::is_decisive)
+        {
+            break Some(2);
+        }
+        if late_result
+            .as_ref()
+            .is_some_and(StartupProbeResult::is_decisive)
+        {
+            break Some(3);
+        }
+        if let (Some(primary_result), Some(backup_result)) =
+            (&primary_result, &backup_result)
+        {
+            let first_two_unsustainable =
+                primary_result.is_unsustainable() && backup_result.is_unsustainable();
+            let waiting_for_staggered = first_two_unsustainable
+                && ((tertiary.is_some() && tertiary_result.is_none())
+                    || (late.is_some() && late_result.is_none()));
+            if !waiting_for_staggered {
+                let mut completed = vec![(0, primary_result), (1, backup_result)];
+                if let Some(result) = tertiary_result.as_ref() {
+                    completed.push((2, result));
+                }
+                if let Some(result) = late_result.as_ref() {
+                    completed.push((3, result));
+                }
+                if completed
+                    .iter()
+                    .all(|(_, result)| result.is_unsustainable())
+                {
+                    break None;
+                }
+                let preferred = preferred_probe_index(
+                    &completed
+                        .iter()
+                        .map(|(_, result)| *result)
+                        .collect::<Vec<_>>(),
+                );
+                break Some(completed[preferred].0);
+            }
+        }
+        tokio::select! {
+            result = &mut primary_probe, if primary_result.is_none() => {
+                log_startup_probe("primary", &result);
+                primary_result = Some(result);
+            }
+            result = &mut backup_probe, if backup_result.is_none() => {
+                log_startup_probe("backup", &result);
+                backup_result = Some(result);
+            }
+            result = &mut tertiary_probe, if tertiary.is_some() && tertiary_result.is_none() => {
+                if let Some(result) = result {
+                    log_startup_probe("tertiary", &result);
+                    tertiary_result = Some(result);
+                }
+            }
+            result = &mut late_probe, if late.is_some() && late_result.is_none() => {
+                if let Some(result) = result {
+                    log_startup_probe("late", &result);
+                    late_result = Some(result);
+                }
+            }
+        }
+    };
+
+    let mut initial_candidates = vec![primary, backup];
+    let mut initial_results = vec![primary_result, backup_result];
+    if let Some(tertiary) = tertiary {
+        initial_candidates.push(tertiary);
+        initial_results.push(tertiary_result);
+    }
+    if let Some(late) = late {
+        initial_candidates.push(late);
+        initial_results.push(late_result);
+    }
+
+    if let Some(selected_index) = selected_index {
+        let selected = initial_candidates.remove(selected_index);
+        initial_results.remove(selected_index);
+        let mut standbys = Vec::new();
+        for (candidate, result) in initial_candidates
+            .into_iter()
+            .zip(initial_results)
+        {
+            if result
+                .as_ref()
+                .is_some_and(StartupProbeResult::is_unsustainable)
+            {
+                mark_failed(&candidate);
+            } else {
+                standbys.push(candidate);
+            }
+        }
+        return Ok(finalize_selection(selected, standbys, &fallbacks));
+    }
+
+    let failed = initial_results
+        .iter()
+        .filter(|result| {
+            result
+                .as_ref()
+                .is_none_or(StartupProbeResult::is_unsustainable)
+        })
+        .count();
+    info!(
+        %play_session_id,
+        failed,
+        remaining = fallbacks.len(),
+        "initial Auto hedge found no sustainable source; advancing immediately"
+    );
+
+    while let Some(first) = fallbacks.pop_front() {
+        let second = fallbacks.pop_front();
+        let remaining_budget =
+            HEDGE_TOTAL_BUDGET.saturating_sub(hedge_started.elapsed());
+        if remaining_budget < Duration::from_millis(250) {
+            break;
+        }
+        let probe_window = remaining_budget.min(HEDGE_PROBE_WINDOW);
+        info!(
+            %play_session_id,
+            first_id = %first.id,
+            second_id = ?second.as_ref().map(|candidate| candidate.id),
+            probe_window_ms = probe_window.as_millis() as u64,
+            remaining_after_wave = fallbacks.len(),
+            "probing next Auto fallback wave"
+        );
+
+        let mut first_probe = Box::pin(probe_torrent_prefix(
+            state
+                .ctx
+                .config
+                .port,
+            first.clone(),
+            probe_window,
+            HEDGE_PROBE_BYTES,
+            item_duration_seconds,
+            start_time_ticks,
+        ));
+        let Some(second) = second else {
+            let first_result = first_probe.await;
+            log_startup_probe("fallback", &first_result);
+            if first_result.is_unsustainable() {
+                continue;
+            }
+            return Ok(finalize_selection(first, Vec::new(), &fallbacks));
+        };
+        let mut second_probe = Box::pin(probe_torrent_prefix(
+            state
+                .ctx
+                .config
+                .port,
+            second.clone(),
+            probe_window,
+            HEDGE_PROBE_BYTES,
+            item_duration_seconds,
+            start_time_ticks,
+        ));
+        let mut first_result = None;
+        let mut second_result = None;
+        let selected_first = loop {
+            if first_result
+                .as_ref()
+                .is_some_and(StartupProbeResult::is_decisive)
+            {
+                break true;
+            }
+            if second_result
+                .as_ref()
+                .is_some_and(StartupProbeResult::is_decisive)
+            {
+                break false;
+            }
+            if let (Some(first_result), Some(second_result)) =
+                (&first_result, &second_result)
+            {
+                break !prefer_backup_probe(first_result, second_result);
+            }
+            tokio::select! {
+                result = &mut first_probe, if first_result.is_none() => {
+                    log_startup_probe("fallback-a", &result);
+                    first_result = Some(result);
+                }
+                result = &mut second_probe, if second_result.is_none() => {
+                    log_startup_probe("fallback-b", &result);
+                    second_result = Some(result);
+                }
+            }
+        };
+
+        let wave_unsustainable = first_result
+            .as_ref()
+            .is_some_and(StartupProbeResult::is_unsustainable)
+            && second_result
+                .as_ref()
+                .is_some_and(StartupProbeResult::is_unsustainable);
+        if wave_unsustainable {
+            continue;
+        }
+
+        let (selected, loser, loser_result) = if selected_first {
+            (first, second, second_result.as_ref())
+        } else {
+            (second, first, first_result.as_ref())
+        };
+        let loser = if loser_result.is_some_and(StartupProbeResult::is_unsustainable) {
+            if loser_result.is_some_and(|result| {
+                result.bytes >= HEDGE_PROBE_BYTES
+                    && result.goodput_bps() > 0.0
+                    && AutoPrebufferPlan::from_probe(result).is_some()
+            }) {
+                Some(loser)
+            } else {
+                mark_failed(&loser);
+                None
+            }
+        } else {
+            Some(loser)
+        };
+        return Ok(finalize_selection(
+            selected,
+            loser
+                .into_iter()
+                .collect(),
+            &fallbacks,
+        ));
+    }
+
+    info!(
+        %play_session_id,
+        candidates = patient_candidates.len(),
+        concurrency = PATIENT_PROBE_CONCURRENCY,
+        probe_bytes = PATIENT_PROBE_BYTES,
+        window_seconds = PATIENT_PROBE_WINDOW.as_secs(),
+        "fast Auto hedge found no streamable source; starting patient probe"
+    );
+    let patient_results = probe_patient_candidates(
+        state
+            .ctx
+            .config
+            .port,
+        &patient_candidates,
+        item_duration_seconds,
+        start_time_ticks,
+    )
+    .await;
+    let completed_patient_ids: std::collections::HashSet<_> = patient_results
+        .iter()
+        .map(|(candidate, _)| candidate.id)
+        .collect();
+    for candidate in &patient_candidates {
+        if !completed_patient_ids.contains(&candidate.id) {
+            schedule_failed_probe_cleanup(state, candidate);
+        }
+    }
+    let mut prebuffer_candidates = Vec::new();
+    for (candidate, result) in patient_results {
+        if !retain_prebuffer_candidate(&mut prebuffer_candidates, &candidate, &result) {
+            mark_failed(&candidate);
+        }
+    }
+
+    if !prebuffer_candidates.is_empty() {
+        let preferred = preferred_patient_probe_index(
+            &prebuffer_candidates
+                .iter()
+                .map(|(_, result)| result)
+                .collect::<Vec<_>>(),
+        );
+        let (selected, result) = prebuffer_candidates.remove(preferred);
+        let standbys = prebuffer_candidates
+            .into_iter()
+            .map(|(candidate, _)| candidate)
+            .collect::<Vec<_>>();
+        let no_remaining = VecDeque::new();
+        let selected = finalize_selection(selected, standbys, &no_remaining);
+        if result.is_decisive() {
+            return Ok(selected);
+        }
+        let plan = save_auto_prebuffer_plan(state, play_session_id, &result)
+            .ok_or_else(|| {
+                anyhow::anyhow!("could not construct Auto prebuffer plan")
+            })?;
+        prebuffer_auto_source(state, play_session_id, &selected, plan).await?;
+        clear_auto_prebuffer_plan(state, play_session_id);
+        return Ok(selected);
+    }
+
+    StreamService::clear_auto_session_winner(
+        &state
+            .ctx
+            .store,
+        play_session_id,
+    );
+    anyhow::bail!(
+        "no Auto {} torrent delivered data during the {}-second patient probe",
+        choice.resolution,
+        PATIENT_PROBE_WINDOW.as_secs()
+    )
+}
+
+async fn is_auto_media_source(
+    ctx: &crate::AppContext,
+    media_source_id: Option<uuid::Uuid>,
+) -> bool {
+    if let Some(id) = media_source_id {
+        if ctx
+            .store
+            .get::<uuid::Uuid>(id.to_string())
+            .is_some()
+        {
+            return true;
+        }
+        // This layer lacks the parent id required to reconstruct a deterministic
+        // Auto UUID. The stored Auto-to-parent mapping is therefore the
+        // authoritative marker here; create_hls_session performs full recovery.
+    }
+    false
+}
 
 /// Shared session setup: look up or create the transcode session for an HLS
 /// request. Returns the session handle and the resolved play_session_id.
@@ -49,7 +1637,38 @@ async fn create_hls_session(
                 .to_string()
         });
 
+    state
+        .ctx
+        .sessions
+        .mark_hls_requested(&play_session_id);
     debug!("Using play session ID: {}", play_session_id);
+
+    // Switching videos on one device must stop the previous ffmpeg input and
+    // release its torrent before resolving the new source. Removing the map
+    // entry alone leaves the old process and download running.
+    let stopped_sessions = state
+        .ctx
+        .sessions
+        .stop_other_for_device(
+            &auth
+                .device
+                .id,
+            &play_session_id,
+        )
+        .await;
+    for stopped_id in stopped_sessions {
+        super::session::abandon_playback_startup(
+            state,
+            &stopped_id,
+            "replaced by another video on the same device",
+        )
+        .await;
+        state
+            .ctx
+            .torrent
+            .release_playback(&stopped_id)
+            .await;
+    }
 
     let encoding_opts_hls = crate::db::Settings::get_encoding_config(
         &state
@@ -93,27 +1712,39 @@ async fn create_hls_session(
     let _create_guard = TRANSCODE_CREATE_LOCKS
         .lock(play_session_id.clone())
         .await;
-    let is_seeking = q
+    let requested_start_secs = q
         .start_time_ticks
-        .is_some_and(|t| t > 0);
-    if is_seeking {
-        if state
+        .unwrap_or(0)
+        .max(0) as u64
+        / 10_000_000;
+    let existing_start_secs = if let Some(existing) = state
+        .ctx
+        .sessions
+        .get_transcode(&play_session_id)
+    {
+        Some(
+            existing
+                .read()
+                .await
+                .start_time_secs as u64,
+        )
+    } else {
+        None
+    };
+    let is_seek_restart =
+        existing_start_secs.is_some_and(|current| current != requested_start_secs);
+    if is_seek_restart {
+        debug!(
+            play_session_id = %play_session_id,
+            previous_start_secs = ?existing_start_secs,
+            requested_start_secs,
+            "seek detected — stopping old transcode session and restarting"
+        );
+        state
             .ctx
             .sessions
-            .get_transcode(&play_session_id)
-            .is_some()
-        {
-            debug!(
-                play_session_id = %play_session_id,
-                start_time_ticks = ?q.start_time_ticks,
-                "seek detected — stopping old transcode session and restarting"
-            );
-            state
-                .ctx
-                .sessions
-                .stop_transcode(&play_session_id)
-                .await;
-        }
+            .stop_transcode(&play_session_id)
+            .await;
     }
     let session = if let Some(existing) = state
         .ctx
@@ -123,17 +1754,137 @@ async fn create_hls_session(
         existing
     } else {
         // Fetch media info to get the stream URL
-        let media_source_id = q
+        let requested_media_source_id = q
             .media_source_id
             .unwrap_or(id);
-        let media = db::Media::get_by_id(
+        let media_source_id = StreamService::auto_session_winner(
+            &state
+                .ctx
+                .store,
+            &play_session_id,
+        )
+        .unwrap_or(requested_media_source_id);
+        if media_source_id != requested_media_source_id {
+            debug!(
+                play_session_id,
+                winner_id = %media_source_id,
+                "using auto winner pinned by PlaybackInfo"
+            );
+        }
+        let mut media = match db::Media::get_by_id(
             &state
                 .ctx
                 .db,
             &media_source_id,
         )
         .await?
-        .context_not_found("media not found")?;
+        {
+            Some(m) => m,
+            None => {
+                // Synthetic Auto sources are not database rows. Recover their
+                // parent and resolution tier so source selection can run again.
+                let parent_from_store = state
+                    .ctx
+                    .store
+                    .get::<uuid::Uuid>(media_source_id.to_string())
+                    .map(|u| *u);
+                let mut found = None;
+                let mut parent_id = id;
+                if let Some(pid) = parent_from_store {
+                    if let Some(res) =
+                        StreamService::auto_resolution(pid, media_source_id)
+                    {
+                        found = Some(res);
+                        parent_id = pid;
+                    }
+                }
+                if found.is_none() {
+                    if let Some(res) =
+                        StreamService::auto_resolution(id, media_source_id)
+                    {
+                        found = Some(res);
+                        parent_id = id;
+                    }
+                }
+                // Some clients place the synthetic id in both the route and
+                // MediaSourceId, so recover the parent from either value.
+                if found.is_none() {
+                    if let Some(pid) = state
+                        .ctx
+                        .store
+                        .get::<uuid::Uuid>(id.to_string())
+                        .map(|u| *u)
+                    {
+                        if let Some(res) =
+                            StreamService::auto_resolution(pid, media_source_id)
+                                .or_else(|| StreamService::auto_resolution(pid, id))
+                        {
+                            found = Some(res);
+                            parent_id = pid;
+                        }
+                    }
+                }
+                if let Some(res) = found {
+                    // Re-run selection because the previously chosen candidate
+                    // may no longer be available.
+                    if let Ok(w) = crate::services::StreamService::resolve_auto(
+                        &state.ctx, parent_id, res, None,
+                    )
+                    .await
+                    {
+                        w
+                    } else {
+                        crate::db::Media {
+                            id: media_source_id,
+                            title: format!("{} (auto)", res),
+                            kind: crate::db::MediaKind::Stream,
+                            ..Default::default()
+                        }
+                    }
+                } else {
+                    None::<crate::db::Media>.context_not_found("media not found")?
+                }
+            }
+        };
+
+        // A placeholder can survive the first pass when source discovery was
+        // temporarily empty. Resolve it again before constructing FFmpeg input.
+        if media
+            .title
+            .ends_with("(auto)")
+        {
+            let res = media
+                .title
+                .trim_end_matches(" (auto)")
+                .trim()
+                .to_string();
+            // Prefer the stored parent mapping; the route id is the fallback
+            // for clients that address the parent item directly.
+            let parent = state
+                .ctx
+                .store
+                .get::<uuid::Uuid>(
+                    media
+                        .id
+                        .to_string(),
+                )
+                .map(|u| *u)
+                .or_else(|| {
+                    state
+                        .ctx
+                        .store
+                        .get::<uuid::Uuid>(id.to_string())
+                        .map(|u| *u)
+                })
+                .unwrap_or(id);
+            if let Ok(w) = crate::services::StreamService::resolve_auto(
+                &state.ctx, parent, &res, None,
+            )
+            .await
+            {
+                media = w;
+            }
+        }
 
         let mut resolved_media = media.clone();
         if resolved_media.kind == db::MediaKind::StreamGroup {
@@ -189,6 +1940,99 @@ async fn create_hls_session(
                 .next()
                 .context_not_found("no stream found for track")?;
         }
+
+        // PlaybackInfo's numeric audio index belongs to the source selected at
+        // that time. Auto hedging may replace it with a different release where
+        // the same number denotes another language, so retain the semantic
+        // language preference before the source can change.
+        let requested_audio_stream_index = q
+            .audio_stream_index
+            .map(|value| value as i32)
+            .filter(|index| *index >= 0);
+        let parent_original_language = db::Media::get_by_id(
+            &state
+                .ctx
+                .db,
+            &id,
+        )
+        .await
+        .ok()
+        .flatten()
+        .and_then(|parent| parent.original_language)
+        .or_else(|| {
+            media
+                .original_language
+                .clone()
+        });
+        let user_configuration = auth
+            .user
+            .configuration
+            .as_ref()
+            .map(|configuration| &configuration.0);
+        let preferred_audio_language = audio_language_for_index(
+            resolved_media
+                .probe_data
+                .as_ref(),
+            requested_audio_stream_index,
+        )
+        .or_else(|| {
+            if user_configuration
+                .map_or(true, |configuration| configuration.play_default_audio_track)
+            {
+                parent_original_language
+                    .as_deref()
+                    .and_then(lang_to_two_letter)
+            } else {
+                user_configuration
+                    .and_then(|configuration| {
+                        configuration
+                            .audio_language_preference
+                            .as_deref()
+                    })
+                    .and_then(lang_to_two_letter)
+            }
+        });
+        let pre_hedge_source_id = resolved_media.id;
+
+        // PlaybackInfo normally pins the ranked Auto choice to the
+        // PlaySessionId. HLS must also reconstruct that pin from the
+        // deterministic Auto MediaSourceId: clients can retry the URL after
+        // clearing their PlaybackInfo state or request the returned URL from a
+        // separate playback context. Without this, the throughput hedge silently
+        // degrades to the metadata-ranked source.
+        if let Some(auto_id) = q.media_source_id {
+            if StreamService::auto_resolution(id, auto_id).is_some() {
+                StreamService::pin_auto_session_winner(
+                    &state
+                        .ctx
+                        .store,
+                    &play_session_id,
+                    id,
+                    auto_id,
+                    resolved_media.id,
+                    None,
+                );
+            }
+        }
+
+        // Auto startup hedging is intentionally server-side and runs whenever
+        // a new transcode is created, including initial playback resumed from
+        // a saved position. Its bounded probes target that requested offset.
+        // A true in-session seek restarts the already-measured source directly.
+        if !is_seek_restart {
+            resolved_media = maybe_hedge_auto_startup(
+                state,
+                &play_session_id,
+                resolved_media,
+                q.start_time_ticks,
+            )
+            .await?;
+        }
+        let source_changed = resolved_media.id != pre_hedge_source_id;
+        state
+            .ctx
+            .sessions
+            .mark_source_selected(&play_session_id, resolved_media.id);
 
         let input_url = resolved_media
             .stream_info
@@ -348,11 +2192,65 @@ async fn create_hls_session(
         let source_audio_stream = resolved_media
             .probe_data
             .as_ref()
-            .and_then(|p| p.audio_stream());
-        let source_audio_codec = source_audio_stream.and_then(|s| {
-            s.codec
+            .and_then(|probe| {
+                select_source_audio_stream(
+                    probe,
+                    requested_audio_stream_index,
+                    preferred_audio_language.as_deref(),
+                    source_changed,
+                )
+            });
+        let source_audio_codec = source_audio_stream.and_then(|stream| {
+            stream
+                .codec
                 .clone()
         });
+        // PlaybackInfo describes the source selected before the startup hedge.
+        // If the hedge switches to a release with a different audio codec, the
+        // client's `AudioCodec=copy` decision is no longer trustworthy. MPEG-TS
+        // browser HLS can safely copy the codecs below; transcode everything
+        // else (notably Opus, DTS and TrueHD) to stereo AAC.
+        let audio_codec =
+            resolve_source_audio_codec(&audio_codec, source_audio_codec.as_deref());
+        let has_stream = |index: i32, stream_type: api::MediaStreamType| {
+            resolved_media
+                .probe_data
+                .as_ref()
+                .map_or(true, |probe| {
+                    probe
+                        .media_streams
+                        .iter()
+                        .any(|stream| {
+                            stream.index == i64::from(index)
+                                && stream.type_ == Some(stream_type)
+                        })
+                })
+        };
+        let audio_stream_index = source_audio_stream
+            .and_then(|stream| i32::try_from(stream.index).ok())
+            .or_else(|| {
+                (!source_changed
+                    && resolved_media
+                        .probe_data
+                        .is_none())
+                .then_some(requested_audio_stream_index)
+                .flatten()
+            });
+        if source_changed && requested_audio_stream_index != audio_stream_index {
+            info!(
+                play_session_id,
+                from_source_id = %pre_hedge_source_id,
+                to_source_id = %resolved_media.id,
+                requested_audio_stream_index = ?requested_audio_stream_index,
+                selected_audio_stream_index = ?audio_stream_index,
+                preferred_audio_language = ?preferred_audio_language,
+                "remapped audio track after Auto source changed"
+            );
+        }
+        let subtitle_stream_index = q
+            .subtitle_stream_index
+            .map(|value| value as i32)
+            .filter(|index| has_stream(*index, api::MediaStreamType::Subtitle));
         let burn_subtitle =
             q.subtitle_method == Some(api::SubtitleDeliveryMethod::Encode);
         let session_video_bitrate = if video_codec == "copy" {
@@ -385,16 +2283,13 @@ async fn create_hls_session(
         let session = TranscodeSession::new(
             play_session_id.clone(),
             id,
-            media_source_id,
+            resolved_media.id,
             input_url.clone(),
             output_dir,
             video_codec.clone(),
             audio_codec.clone(),
-            q.audio_stream_index
-                .map(|v| v as i32)
-                .filter(|&v| v >= 0),
-            q.subtitle_stream_index
-                .map(|v| v as i32),
+            audio_stream_index,
+            subtitle_stream_index,
             burn_subtitle,
             segment_length,
             // Parse reasons from query param (set by playbackinfo on the transcoding URL)
@@ -415,6 +2310,14 @@ async fn create_hls_session(
             session_video_bitrate,
             session_hw_accel,
         );
+
+        // Record the requested origin before publishing the session. This lets
+        // a duplicate master request distinguish itself from a real seek even
+        // if FFmpeg has not started yet.
+        session
+            .write()
+            .await
+            .start_time_secs = requested_start_secs.min(u32::MAX as u64) as u32;
 
         state
             .ctx
@@ -460,13 +2363,8 @@ async fn create_hls_session(
             // (e.g. 6.1 from DTS-HD) causes MEDIA_ERR_SRC_NOT_SUPPORTED on most
             // browsers and iOS Safari.
             audio_channels: if audio_codec == "copy" { None } else { Some(2) },
-            audio_stream_index: q
-                .audio_stream_index
-                .map(|v| v as i32)
-                .filter(|&v| v >= 0),
-            subtitle_stream_index: q
-                .subtitle_stream_index
-                .map(|v| v as i32),
+            audio_stream_index,
+            subtitle_stream_index,
             burn_subtitle,
             subtitle_width: None,
             subtitle_height: None,
@@ -516,6 +2414,10 @@ async fn create_hls_session(
                 .unwrap_or(false),
         };
 
+        state
+            .ctx
+            .sessions
+            .mark_transcode_started(&play_session_id);
         // Spawn the transcode task with proper error handling
         let media_title_for_log = resolved_media
             .title
@@ -560,8 +2462,7 @@ async fn create_hls_session(
                 hw_accel = ?params.accelerator.as_type(),
                 transcode_reasons = ?transcode_reasons_for_log,
                 start_secs,
-                video_transcoding_enabled,
-                "▶ Playback started (transcode)"
+                "Transcode started"
             );
             if let Err(e) =
                 crate::playback::engine::start_transcode(session_clone, params).await
@@ -586,7 +2487,39 @@ pub async fn master_hls_video(
     debug!("master_hls_video: item_id={}, q={:?}", id, q);
     let (session, _) = match create_hls_session(&state, &auth, id, &q).await {
         Ok(s) => s,
-        Err(_) => {
+        Err(error) => {
+            let error_text = format!("{error:?}");
+            if let Some(play_session_id) = q
+                .play_session_id
+                .as_deref()
+            {
+                if let Some(report) = state
+                    .ctx
+                    .sessions
+                    .fail_startup(play_session_id, error_text.clone())
+                {
+                    if let Err(persist_error) = db::record_playback_startup(
+                        &state
+                            .ctx
+                            .db,
+                        &report,
+                    )
+                    .await
+                    {
+                        warn!(
+                            %persist_error,
+                            %play_session_id,
+                            "failed to persist playback startup failure"
+                        );
+                    }
+                }
+                warn!(
+                    %play_session_id,
+                    item_id = %id,
+                    error = %error_text,
+                    "Playback startup failed"
+                );
+            }
             return Ok(axum::response::Redirect::temporary("/videos/no-streams")
                 .into_response());
         }
@@ -652,6 +2585,85 @@ fn resolve_live_audio_codec(is_live: bool, requested: &str) -> String {
     } else {
         requested.to_string()
     }
+}
+
+fn resolve_source_audio_codec(requested: &str, source_codec: Option<&str>) -> String {
+    if requested != "copy" {
+        return requested.to_string();
+    }
+    match source_codec
+        .map(str::to_ascii_lowercase)
+        .as_deref()
+    {
+        Some("aac" | "mp2" | "mp3") => "copy".to_string(),
+        Some(_) => "aac".to_string(),
+        // A newly selected torrent may not have probe metadata yet. Copying an
+        // unknown codec into MPEG-TS is unsafe for WebOS/browser decoders; AAC
+        // stereo is the compatibility-safe default and is cheap to encode.
+        None => "aac".to_string(),
+    }
+}
+
+fn audio_language_for_index(
+    source: Option<&api::MediaSourceInfo>,
+    index: Option<i32>,
+) -> Option<String> {
+    let index = i64::from(index?);
+    source?
+        .media_streams
+        .iter()
+        .find(|stream| {
+            stream.index == index
+                && matches!(stream.type_, Some(api::MediaStreamType::Audio))
+        })
+        .and_then(|stream| {
+            stream
+                .language
+                .as_deref()
+        })
+        .and_then(lang_to_two_letter)
+}
+
+fn select_source_audio_stream<'a>(
+    source: &'a api::MediaSourceInfo,
+    requested_index: Option<i32>,
+    preferred_language: Option<&str>,
+    source_changed: bool,
+) -> Option<&'a api::MediaStream> {
+    if !source_changed {
+        if let Some(index) = requested_index {
+            if let Some(stream) = source
+                .media_streams
+                .iter()
+                .find(|stream| {
+                    stream.index == i64::from(index)
+                        && matches!(stream.type_, Some(api::MediaStreamType::Audio))
+                })
+            {
+                return Some(stream);
+            }
+        }
+    }
+
+    if let Some(target) = preferred_language.and_then(lang_to_two_letter) {
+        if let Some(stream) = source
+            .media_streams
+            .iter()
+            .find(|stream| {
+                matches!(stream.type_, Some(api::MediaStreamType::Audio))
+                    && stream
+                        .language
+                        .as_deref()
+                        .and_then(lang_to_two_letter)
+                        .as_deref()
+                        == Some(target.as_str())
+            })
+        {
+            return Some(stream);
+        }
+    }
+
+    source.audio_stream()
 }
 
 fn should_serve_ffmpeg_variant_playlist(
@@ -878,10 +2890,10 @@ async fn serve_file_with_length(
 /// consecutive polls.
 ///
 /// ffmpeg creates HLS init/segment files *before* flushing their content, so
-/// checking existence alone can serve a 0-byte init segment to the player —
-/// the browser's MSE/AVFoundation decoder can't initialize from an empty init
-/// and playback fails hard until the user re-enters (by which time the file is
-/// complete). Returns true once the file is ready (or already was).
+/// checking existence alone can serve a 0-byte init segment to the player.
+/// MSE and AVFoundation cannot initialize from an empty fragment, so require a
+/// stable non-zero size before serving it. Returns true once the file is ready
+/// (or already was).
 async fn wait_for_file_ready(
     path: &std::path::Path,
     timeout: std::time::Duration,
@@ -911,6 +2923,559 @@ async fn wait_for_file_ready(
     }
     // Last chance: file exists and is non-empty right now.
     matches!(tokio::fs::metadata(path).await, Ok(m) if m.len() > 0)
+}
+
+fn slow_auto_observation_window(segment_length: u32) -> std::time::Duration {
+    std::time::Duration::from_secs(
+        u64::from(segment_length)
+            .saturating_mul(3)
+            .clamp(12, 24),
+    )
+}
+
+fn slow_auto_startup_ratio(
+    elapsed: std::time::Duration,
+    segment_length: u32,
+    current_idx: Option<u32>,
+    requested_idx: u32,
+) -> Option<f64> {
+    if segment_length == 0
+        || current_idx.is_some_and(|current| requested_idx <= current)
+        || elapsed > std::time::Duration::from_secs(2 * 60)
+    {
+        return None;
+    }
+
+    if elapsed < slow_auto_observation_window(segment_length) {
+        return None;
+    }
+
+    let produced_secs = current_idx
+        .map(|current| u64::from(current.saturating_add(1)) * u64::from(segment_length))
+        .unwrap_or(0);
+    let production_ratio = produced_secs as f64
+        / elapsed
+            .as_secs_f64()
+            .max(1.0);
+    (production_ratio < 0.75).then_some(production_ratio)
+}
+
+fn transcoded_segment_age(
+    output_dir: &std::path::Path,
+    segment_index: u32,
+) -> Option<std::time::Duration> {
+    ["ts", "m4s"]
+        .into_iter()
+        .find_map(|extension| {
+            std::fs::metadata(
+                output_dir.join(format!("segment_{segment_index:05}.{extension}")),
+            )
+            .ok()
+        })
+        .and_then(|metadata| {
+            metadata
+                .modified()
+                .ok()
+        })
+        .and_then(|modified| {
+            modified
+                .elapsed()
+                .ok()
+        })
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AutoSourceSwitch {
+    NotNeeded,
+    Switched,
+    Exhausted,
+}
+
+async fn maybe_switch_slow_auto_source(
+    state: &AppState,
+    session: &Arc<tokio::sync::RwLock<TranscodeSession>>,
+    play_session_id: &str,
+    requested_idx: u32,
+) -> AutoSourceSwitch {
+    let (
+        item_id,
+        old_source_id,
+        output_dir,
+        segment_length,
+        elapsed,
+        selected_audio_index,
+    ) = {
+        let session = session
+            .read()
+            .await;
+        (
+            session.item_id,
+            session.media_source_id,
+            session
+                .output_dir
+                .clone(),
+            session.segment_length,
+            session
+                .created_at
+                .elapsed(),
+            session.audio_stream_index,
+        )
+    };
+    let current_idx = get_current_transcoding_index(&output_dir);
+    if current_idx
+        .and_then(|current| transcoded_segment_age(&output_dir, current))
+        .is_some_and(|age| {
+            age < std::time::Duration::from_secs(u64::from(segment_length).max(1))
+        })
+    {
+        return AutoSourceSwitch::NotNeeded;
+    }
+    let Some(production_ratio) =
+        slow_auto_startup_ratio(elapsed, segment_length, current_idx, requested_idx)
+    else {
+        return AutoSourceSwitch::NotNeeded;
+    };
+
+    let Some(choice) = StreamService::auto_session_choice(
+        &state
+            .ctx
+            .store,
+        play_session_id,
+    ) else {
+        return AutoSourceSwitch::NotNeeded;
+    };
+    if choice.item_id != item_id || choice.winner_id != old_source_id {
+        return AutoSourceSwitch::NotNeeded;
+    }
+    if !StreamService::claim_auto_failover_attempt(
+        &state
+            .ctx
+            .store,
+        play_session_id,
+        old_source_id,
+    ) {
+        return AutoSourceSwitch::NotNeeded;
+    }
+    if !StreamService::claim_auto_failover_slot(
+        &state
+            .ctx
+            .store,
+        play_session_id,
+    ) {
+        warn!(
+            %play_session_id,
+            %old_source_id,
+            "Auto startup fallback budget exhausted"
+        );
+        StreamService::clear_auto_session_winner(
+            &state
+                .ctx
+                .store,
+            play_session_id,
+        );
+        if let Some(report) = state
+            .ctx
+            .sessions
+            .fail_startup(play_session_id, "Auto startup fallback budget exhausted")
+        {
+            if let Err(error) = db::record_playback_startup(
+                &state
+                    .ctx
+                    .db,
+                &report,
+            )
+            .await
+            {
+                warn!(
+                    %error,
+                    %play_session_id,
+                    "failed to persist exhausted playback startup metric"
+                );
+            }
+        }
+        state
+            .ctx
+            .sessions
+            .stop_transcode(play_session_id)
+            .await;
+        state
+            .ctx
+            .torrent
+            .release_playback(play_session_id)
+            .await;
+        return AutoSourceSwitch::Exhausted;
+    }
+
+    let old_source = match db::Media::get_by_id(
+        &state
+            .ctx
+            .db,
+        &old_source_id,
+    )
+    .await
+    {
+        Ok(Some(source)) => source,
+        Ok(None) => return AutoSourceSwitch::NotNeeded,
+        Err(error) => {
+            warn!(
+                %play_session_id,
+                %old_source_id,
+                %error,
+                "failed to inspect slow Auto source"
+            );
+            return AutoSourceSwitch::NotNeeded;
+        }
+    };
+    if !old_source
+        .stream_info
+        .as_ref()
+        .is_some_and(|info| info.is_p2p())
+    {
+        return AutoSourceSwitch::NotNeeded;
+    }
+    let parent_original_language = db::Media::get_by_id(
+        &state
+            .ctx
+            .db,
+        &item_id,
+    )
+    .await
+    .ok()
+    .flatten()
+    .and_then(|item| item.original_language);
+    let preferred_audio_language = audio_language_for_index(
+        old_source
+            .probe_data
+            .as_ref(),
+        selected_audio_index,
+    )
+    .or_else(|| {
+        old_source
+            .probe_data
+            .as_ref()
+            .and_then(|probe| probe.audio_stream())
+            .and_then(|stream| {
+                stream
+                    .language
+                    .as_deref()
+            })
+            .and_then(lang_to_two_letter)
+    })
+    // If the old source was never probed, the title's original language is
+    // still a better semantic key than carrying a numeric stream index to an
+    // unrelated release.
+    .or_else(|| {
+        parent_original_language
+            .as_deref()
+            .and_then(lang_to_two_letter)
+    });
+
+    warn!(
+        %play_session_id,
+        %old_source_id,
+        title = %old_source.title,
+        requested_idx,
+        ?current_idx,
+        elapsed_secs = elapsed.as_secs_f64(),
+        production_ratio,
+        "Auto source cannot sustain startup; selecting a fallback"
+    );
+    StreamService::mark_auto_candidate_failed(
+        &state
+            .ctx
+            .store,
+        choice.item_id,
+        &choice.resolution,
+        &old_source,
+    );
+
+    let mut warm_backup = None;
+    for backup_id in choice
+        .fallback_ids
+        .iter()
+        .copied()
+        .filter(|backup_id| *backup_id != old_source_id)
+    {
+        match db::Media::get_by_id(
+            &state
+                .ctx
+                .db,
+            &backup_id,
+        )
+        .await
+        {
+            Ok(Some(backup))
+                if backup
+                    .stream_info
+                    .as_ref()
+                    .is_some_and(|info| info.is_p2p())
+                    && !StreamService::is_auto_candidate_failed(
+                        &state
+                            .ctx
+                            .store,
+                        choice.item_id,
+                        &choice.resolution,
+                        &backup,
+                    ) =>
+            {
+                warm_backup = Some(backup);
+                break;
+            }
+            Ok(_) => {}
+            Err(error) => {
+                warn!(
+                    %play_session_id,
+                    %backup_id,
+                    %error,
+                    "failed to load Auto warm fallback"
+                );
+            }
+        }
+    }
+    let (replacement, used_warm_backup) = if let Some(replacement) = warm_backup {
+        info!(
+            %play_session_id,
+            replacement_id = %replacement.id,
+            replacement_title = %replacement.title,
+            "using measured Auto warm fallback"
+        );
+        (replacement, true)
+    } else {
+        match StreamService::resolve_auto(
+            &state.ctx,
+            choice.item_id,
+            &choice.resolution,
+            choice.user_id,
+        )
+        .await
+        {
+            Ok(replacement) => (replacement, false),
+            Err(error) => {
+                warn!(
+                    %play_session_id,
+                    %old_source_id,
+                    %error,
+                    "Auto fallback selection failed"
+                );
+                return AutoSourceSwitch::NotNeeded;
+            }
+        }
+    };
+    let session_still_attached = state
+        .ctx
+        .sessions
+        .get_transcode(play_session_id)
+        .is_some_and(|attached| Arc::ptr_eq(&attached, session));
+    if !session_still_attached {
+        return AutoSourceSwitch::NotNeeded;
+    }
+    let (source_unchanged, latest_elapsed) = {
+        let transcode = session
+            .read()
+            .await;
+        (
+            transcode.media_source_id == old_source_id,
+            transcode
+                .created_at
+                .elapsed(),
+        )
+    };
+    if !source_unchanged {
+        return AutoSourceSwitch::NotNeeded;
+    }
+    let latest_idx = get_current_transcoding_index(&output_dir);
+    if slow_auto_startup_ratio(
+        latest_elapsed,
+        segment_length,
+        latest_idx,
+        requested_idx,
+    )
+    .is_none()
+    {
+        StreamService::clear_auto_candidate_failed(
+            &state
+                .ctx
+                .store,
+            choice.item_id,
+            &choice.resolution,
+            &old_source,
+        );
+        info!(
+            %play_session_id,
+            %old_source_id,
+            ?latest_idx,
+            elapsed_secs = latest_elapsed.as_secs_f64(),
+            "Auto source recovered while fallback was being evaluated"
+        );
+        return AutoSourceSwitch::NotNeeded;
+    }
+    if replacement.id == old_source_id {
+        warn!(
+            %play_session_id,
+            %old_source_id,
+            "Auto fallback had no alternate candidate"
+        );
+        return AutoSourceSwitch::NotNeeded;
+    }
+
+    let Some(stream_info) = replacement
+        .stream_info
+        .as_ref()
+    else {
+        warn!(
+            %play_session_id,
+            replacement_id = %replacement.id,
+            "Auto fallback has no stream URL"
+        );
+        return AutoSourceSwitch::NotNeeded;
+    };
+    let input_url = stream_info
+        .descriptor
+        .server_input(
+            replacement.id,
+            state
+                .ctx
+                .config
+                .port,
+        );
+    let source_video_stream = replacement
+        .probe_data
+        .as_ref()
+        .and_then(|probe| probe.video_stream());
+    let source_audio_stream = replacement
+        .probe_data
+        .as_ref()
+        .and_then(|probe| {
+            select_source_audio_stream(
+                probe,
+                selected_audio_index,
+                preferred_audio_language.as_deref(),
+                true,
+            )
+        });
+    let replacement_audio_codec = source_audio_stream.and_then(|stream| {
+        stream
+            .codec
+            .clone()
+    });
+
+    let mut transcode = session
+        .write()
+        .await;
+    if transcode.media_source_id != old_source_id {
+        return AutoSourceSwitch::NotNeeded;
+    }
+    let requested_audio_index = transcode.audio_stream_index;
+    let requested_subtitle_index = transcode.subtitle_stream_index;
+    let replacement_has_subtitle_index = |index: i32| {
+        replacement
+            .probe_data
+            .as_ref()
+            .is_some_and(|probe| {
+                probe
+                    .media_streams
+                    .iter()
+                    .any(|stream| {
+                        stream.index == i64::from(index)
+                            && matches!(
+                                stream.type_,
+                                Some(api::MediaStreamType::Subtitle)
+                            )
+                    })
+            })
+    };
+
+    transcode.media_source_id = replacement.id;
+    transcode.input_url = input_url;
+    transcode.created_at = std::time::Instant::now();
+    transcode.source_video_codec = source_video_stream.and_then(|stream| {
+        stream
+            .codec
+            .clone()
+    });
+    transcode.source_video_profile = source_video_stream.and_then(|stream| {
+        stream
+            .profile
+            .clone()
+    });
+    transcode.source_video_level = source_video_stream.and_then(|stream| stream.level);
+    transcode.source_video_range_type =
+        source_video_stream.and_then(|stream| stream.video_range_type);
+    transcode.source_video_width = source_video_stream.and_then(|stream| stream.width);
+    transcode.source_video_height =
+        source_video_stream.and_then(|stream| stream.height);
+    transcode.source_frame_rate =
+        source_video_stream.and_then(|stream| stream.real_frame_rate);
+    transcode.audio_codec = resolve_source_audio_codec(
+        &transcode.audio_codec,
+        replacement_audio_codec.as_deref(),
+    );
+    transcode.source_audio_codec = replacement_audio_codec;
+    transcode.audio_stream_index =
+        source_audio_stream.and_then(|stream| i32::try_from(stream.index).ok());
+    if requested_audio_index != transcode.audio_stream_index {
+        info!(
+            %play_session_id,
+            from_source_id = %old_source_id,
+            to_source_id = %replacement.id,
+            requested_audio_stream_index = ?requested_audio_index,
+            selected_audio_stream_index = ?transcode.audio_stream_index,
+            preferred_audio_language = ?preferred_audio_language,
+            "remapped audio track after Auto fallback source changed"
+        );
+    }
+    transcode.subtitle_stream_index =
+        requested_subtitle_index.filter(|index| replacement_has_subtitle_index(*index));
+    if requested_subtitle_index.is_some()
+        && transcode
+            .subtitle_stream_index
+            .is_none()
+    {
+        transcode.burn_subtitle = false;
+    }
+    drop(transcode);
+
+    if used_warm_backup {
+        StreamService::update_auto_session_choice(
+            &state
+                .ctx
+                .store,
+            play_session_id,
+            replacement.id,
+            choice
+                .fallback_ids
+                .iter()
+                .copied()
+                .filter(|candidate_id| {
+                    *candidate_id != replacement.id && *candidate_id != old_source_id
+                })
+                .collect(),
+        );
+    } else {
+        let auto_id = StreamService::auto_source_id(choice.item_id, &choice.resolution);
+        StreamService::pin_auto_session_winner(
+            &state
+                .ctx
+                .store,
+            play_session_id,
+            choice.item_id,
+            auto_id,
+            replacement.id,
+            choice.user_id,
+        );
+    }
+    state
+        .ctx
+        .sessions
+        .mark_source_selected(play_session_id, replacement.id);
+    warn!(
+        %play_session_id,
+        %old_source_id,
+        replacement_id = %replacement.id,
+        replacement_title = %replacement.title,
+        "Auto source fallback selected"
+    );
+    AutoSourceSwitch::Switched
 }
 
 async fn hls_segment_inner(
@@ -1008,10 +3573,68 @@ async fn hls_segment_inner(
         }
     }
 
+    // The first segment request normally arrives immediately after FFmpeg starts.
+    // Waiting for the full 60-second segment timeout means the slow-source check
+    // never runs again unless the client gives up and retries. For Auto playback,
+    // stage the wait at the observation boundary so this same request can switch
+    // sources server-side as soon as startup is demonstrably too slow.
+    if !segment_path.exists() {
+        if let (Some(session), Some(requested_idx)) = (&session, requested_idx) {
+            let observation_wait = {
+                let transcode = session
+                    .read()
+                    .await;
+                let choice = StreamService::auto_session_choice(
+                    &state
+                        .ctx
+                        .store,
+                    &play_session_id,
+                );
+                let current_idx = get_current_transcoding_index(&transcode.output_dir);
+                choice
+                    .filter(|choice| {
+                        choice.item_id == transcode.item_id
+                            && choice.winner_id == transcode.media_source_id
+                            && current_idx
+                                .map_or(true, |current| requested_idx > current)
+                    })
+                    .and_then(|_| {
+                        slow_auto_observation_window(transcode.segment_length)
+                            .checked_sub(
+                                transcode
+                                    .created_at
+                                    .elapsed(),
+                            )
+                    })
+                    .filter(|remaining| !remaining.is_zero())
+            };
+            if let Some(observation_wait) = observation_wait {
+                let _ = wait_for_file_ready(&segment_path, observation_wait).await;
+            }
+        }
+    }
+
     // If the segment doesn't exist and we have a live session, check whether
     // FFmpeg needs to be restarted at a different position (like Jellyfin does).
     if !segment_path.exists() {
         if let (Some(session), Some(requested_idx)) = (&session, requested_idx) {
+            let failed_source_id = session
+                .read()
+                .await
+                .media_source_id;
+            let source_switch = maybe_switch_slow_auto_source(
+                &state,
+                session,
+                &play_session_id,
+                requested_idx,
+            )
+            .await;
+            if source_switch == AutoSourceSwitch::Exhausted {
+                None::<()>.context_not_found(
+                    "Auto startup exhausted its measured fallback",
+                )?;
+            }
+            let force_restart = source_switch == AutoSourceSwitch::Switched;
             let s = session
                 .read()
                 .await;
@@ -1022,24 +3645,26 @@ async fn hls_segment_inner(
             let current_idx = get_current_transcoding_index(&output_dir);
             let segment_gap_threshold = 24 / segment_length;
 
-            let needs_restart = match current_idx {
-                None => {
-                    // No segments on disk yet. If FFmpeg is still running
-                    // (Starting/Running), just fall through to the wait loop —
-                    // killing it here causes an infinite restart cycle.
-                    matches!(
-                        s.state,
-                        TranscodeState::Error(_) | TranscodeState::Complete
-                    )
-                }
-                Some(cur) if requested_idx < cur => true, // seeking backward
-                Some(cur)
-                    if requested_idx.saturating_sub(cur) > segment_gap_threshold =>
-                {
-                    true
-                } // too far ahead
-                _ => false, // within range — just wait for FFmpeg
-            };
+            let needs_restart = force_restart
+                || match current_idx {
+                    None => {
+                        // No segments on disk yet. If FFmpeg is still running
+                        // (Starting/Running), just fall through to the wait loop —
+                        // killing it here causes an infinite restart cycle.
+                        matches!(
+                            s.state,
+                            TranscodeState::Error(_) | TranscodeState::Complete
+                        )
+                    }
+                    Some(cur) if requested_idx < cur => true, // seeking backward
+                    Some(cur)
+                        if requested_idx.saturating_sub(cur)
+                            > segment_gap_threshold =>
+                    {
+                        true
+                    } // too far ahead
+                    _ => false, // within range — just wait for FFmpeg
+                };
 
             if needs_restart {
                 // Guard against concurrent restart: only proceed if FFmpeg
@@ -1048,7 +3673,7 @@ async fn hls_segment_inner(
                 let has_running_ffmpeg = s
                     .kill_tx
                     .is_some();
-                if !has_running_ffmpeg {
+                if !has_running_ffmpeg && !force_restart {
                     drop(s);
                     // Another request already restarted — fall through to wait loop.
                 } else {
@@ -1056,6 +3681,7 @@ async fn hls_segment_inner(
                         requested_idx,
                         ?current_idx,
                         segment_gap_threshold,
+                        force_restart,
                         "Segment-driven transcode restart"
                     );
 
@@ -1073,6 +3699,20 @@ async fn hls_segment_inner(
                     let subtitle_stream_index = s.subtitle_stream_index;
                     let burn_subtitle = s.burn_subtitle;
                     drop(s);
+
+                    // Stop the rejected torrent before waiting for FFmpeg to
+                    // exit. The old HTTP input guard is still alive until that
+                    // process dies, so the normal idle-release path would let a
+                    // runaway source keep consuming bandwidth and disk here.
+                    let failed_torrent_id = if force_restart {
+                        state
+                            .ctx
+                            .torrent
+                            .pause_playback_for_switch(&play_session_id)
+                            .await
+                    } else {
+                        None
+                    };
 
                     // Kill running FFmpeg and clean up stale segments (params
                     // like bitrate/codec may change, so old segments are invalid).
@@ -1092,6 +3732,33 @@ async fn hls_segment_inner(
                             let notification = wait_done.notified();
                             let _ = kill_tx.send(());
                             notification.await;
+                        }
+                    }
+                    if let Some(failed_torrent_id) = failed_torrent_id {
+                        match state
+                            .ctx
+                            .torrent
+                            .discard_failed_torrent_if_unwatched(
+                                &state
+                                    .ctx
+                                    .db,
+                                failed_torrent_id,
+                                failed_source_id,
+                            )
+                            .await
+                        {
+                            Ok(true) => {}
+                            Ok(false) => debug!(
+                                %play_session_id,
+                                %failed_source_id,
+                                "kept failed Auto torrent because it was watched or still active"
+                            ),
+                            Err(error) => warn!(
+                                %play_session_id,
+                                %failed_source_id,
+                                %error,
+                                "failed to discard unwatched Auto torrent"
+                            ),
                         }
                     }
                     let _ = std::fs::remove_dir_all(&output_dir);
@@ -1253,7 +3920,10 @@ async fn hls_segment_inner(
         .ctx
         .sessions
         .ping(&play_session_id);
-
+    state
+        .ctx
+        .sessions
+        .mark_first_segment_served(&play_session_id);
     // fMP4 segments (.m4s) use video/mp4; MPEG-TS segments use video/mp2t.
     let content_type = if segment_path
         .extension()
@@ -1270,12 +3940,449 @@ async fn hls_segment_inner(
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
+    fn startup_probe(
+        goodput_mbps: f64,
+        required_mbps: Option<f64>,
+    ) -> super::StartupProbeResult {
+        let bytes = super::HEDGE_PROBE_BYTES;
+        let elapsed =
+            Duration::from_secs_f64(bytes as f64 * 8.0 / (goodput_mbps * 1_000_000.0));
+        super::StartupProbeResult {
+            source_id: uuid::Uuid::nil(),
+            title: "test".to_string(),
+            range_start: 0,
+            source_size_bytes: None,
+            bytes,
+            elapsed,
+            warmup_elapsed: None,
+            verified_live_sample: false,
+            required_bitrate_bps: required_mbps.map(|value| value * 1_000_000.0),
+            error: None,
+        }
+    }
+
+    #[test]
+    fn startup_hedge_uses_release_bitrate_not_raw_speed_alone() {
+        let primary = startup_probe(12.0, Some(12.0));
+        let backup = startup_probe(8.0, Some(4.0));
+        assert!(super::prefer_backup_probe(&primary, &backup));
+    }
+
+    #[test]
+    fn startup_hedge_can_choose_a_staggered_third_probe() {
+        let primary = startup_probe(2.0, Some(4.0));
+        let backup = startup_probe(4.0, Some(4.0));
+        let tertiary = startup_probe(12.0, Some(4.0));
+
+        assert_eq!(
+            super::preferred_probe_index(&[&primary, &backup, &tertiary]),
+            2
+        );
+    }
+
+    #[test]
+    fn patient_probe_prefers_warm_throughput_over_peer_setup_time() {
+        let mut slow_setup = startup_probe(1.0, Some(30.0));
+        slow_setup.bytes = super::PATIENT_PROBE_BYTES;
+        slow_setup.elapsed = Duration::from_secs(34);
+        slow_setup.warmup_elapsed = Some(Duration::from_millis(33_370));
+
+        let quick_but_slow = startup_probe(18.5, Some(39.2));
+
+        assert!(slow_setup.goodput_bps() > 26_000_000.0);
+        assert!(slow_setup.cold_goodput_bps() < 1_000_000.0);
+        assert!(!super::prefer_backup_probe(&quick_but_slow, &slow_setup));
+        assert!(super::prefer_patient_probe(&quick_but_slow, &slow_setup));
+    }
+
+    #[test]
+    fn startup_hedge_uses_item_duration_when_release_duration_is_missing() {
+        let media = crate::db::Media {
+            stream_info: Some(crate::stream::StreamInfo {
+                size: Some(1_000_000_000),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let bitrate =
+            super::required_source_bitrate_bps(&media, Some(1_000.0), None).unwrap();
+
+        assert_eq!(bitrate, 8_000_000.0);
+    }
+
+    #[test]
+    fn startup_hedge_uses_observed_selected_file_size() {
+        let media = crate::db::Media::default();
+
+        let bitrate = super::required_source_bitrate_bps(
+            &media,
+            Some(1_000.0),
+            Some(1_000_000_000),
+        )
+        .unwrap();
+
+        assert_eq!(bitrate, 8_000_000.0);
+    }
+
+    #[test]
+    fn startup_hedge_does_not_mistake_a_piece_burst_for_throughput() {
+        let mut burst = startup_probe(24.0, Some(24.0));
+        burst.bytes = super::HEDGE_PROBE_BYTES;
+        burst.elapsed = Duration::from_millis(5_050);
+        burst.warmup_elapsed = Some(Duration::from_millis(5_045));
+
+        assert_eq!(burst.goodput_bps(), burst.cold_goodput_bps());
+        assert!(
+            burst
+                .cold_headroom()
+                .is_some_and(|headroom| headroom < super::HEDGE_MIN_COLD_HEADROOM)
+        );
+        assert!(!burst.is_decisive());
+        assert!(burst.is_unsustainable());
+    }
+
+    #[test]
+    fn startup_hedge_rejects_a_short_burst_despite_cold_recovery_allowance() {
+        let mut burst = startup_probe(18.0, Some(18.0));
+        burst.bytes = super::HEDGE_PROBE_BYTES;
+        burst.elapsed = Duration::from_millis(2_300);
+        burst.warmup_elapsed = Some(Duration::from_millis(2_298));
+
+        assert!(
+            burst
+                .cold_headroom()
+                .is_some_and(|headroom| headroom >= super::HEDGE_MIN_COLD_HEADROOM)
+        );
+        assert_eq!(burst.goodput_bps(), burst.cold_goodput_bps());
+        assert!(!burst.is_decisive());
+        assert!(burst.is_unsustainable());
+    }
+
+    #[test]
+    fn startup_hedge_requires_data_beyond_a_cached_prefix() {
+        let mut cached_prefix = startup_probe(2_000.0, Some(10.0));
+        cached_prefix.bytes = super::HEDGE_PREFIX_BYTES;
+        cached_prefix.elapsed = Duration::from_millis(10);
+        cached_prefix.warmup_elapsed = Some(Duration::from_millis(1));
+
+        assert!(
+            cached_prefix
+                .headroom()
+                .is_some_and(|headroom| headroom > 100.0)
+        );
+        assert!(!cached_prefix.is_decisive());
+    }
+
+    #[test]
+    fn startup_hedge_cache_busts_an_instant_complete_probe() {
+        let mut cached_probe = startup_probe(2_000.0, Some(10.0));
+        cached_probe.elapsed = Duration::from_millis(10);
+        cached_probe.warmup_elapsed = Some(Duration::from_millis(1));
+
+        assert!(cached_probe.sample_is_inconclusive());
+        assert!(cached_probe.is_unsustainable());
+        assert!(!cached_probe.is_decisive());
+
+        cached_probe.verified_live_sample = true;
+        assert!(!cached_probe.sample_is_inconclusive());
+        assert!(cached_probe.is_decisive());
+    }
+
+    #[test]
+    fn cache_bust_probe_does_not_overlap_the_startup_range() {
+        let source_size = 18_000_000_000;
+        let startup_start = 0;
+        let sample_start =
+            super::cache_bust_probe_range_start(source_size, startup_start).unwrap();
+        let sample_end = sample_start + super::HEDGE_STEADY_SAMPLE_BYTES;
+
+        assert!(sample_end <= source_size);
+        assert!(sample_start >= super::HEDGE_PROBE_BYTES);
+    }
+
+    #[test]
+    fn resumed_startup_probe_targets_the_requested_time() {
+        let media = crate::db::Media {
+            stream_info: Some(crate::stream::StreamInfo {
+                size: Some(10_000_000_000),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let range_start = super::startup_probe_range_start(
+            &media,
+            Some(1_000.0),
+            Some(500 * 10_000_000),
+        );
+
+        assert_eq!(range_start, 5_000_000_000);
+    }
+
+    #[test]
+    fn startup_probe_falls_back_to_the_prefix_without_timing_metadata() {
+        let media = crate::db::Media {
+            stream_info: Some(crate::stream::StreamInfo {
+                size: Some(10_000_000_000),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            super::startup_probe_range_start(&media, None, Some(500 * 10_000_000),),
+            0
+        );
+    }
+
+    #[test]
+    fn startup_hedge_requires_sustainable_headroom() {
+        assert!(!startup_probe(13.4, Some(10.0)).is_strong());
+        assert!(startup_probe(13.6, Some(10.0)).is_strong());
+    }
+
+    #[test]
+    fn startup_hedge_separates_cold_peer_setup_from_warm_throughput() {
+        let mut probe = startup_probe(1.0, Some(10.0));
+        probe.bytes = super::HEDGE_PROBE_BYTES;
+        probe.elapsed = Duration::from_millis(4_500);
+        probe.warmup_elapsed = Some(Duration::from_millis(4_200));
+
+        assert!(probe.cold_goodput_bps() < 5_000_000.0);
+        assert!(probe.goodput_bps() > 13_500_000.0);
+        assert!(probe.is_strong());
+    }
+
+    #[test]
+    fn completed_probe_with_modest_headroom_is_viable() {
+        let mut probe = startup_probe(11.6, Some(10.0));
+        probe.bytes = super::HEDGE_PROBE_BYTES;
+        probe.elapsed =
+            Duration::from_secs_f64(probe.bytes as f64 * 8.0 / 11_600_000.0);
+        assert!(probe.is_viable());
+        assert!(probe.is_decisive());
+    }
+
+    #[test]
+    fn startup_hedge_uses_buffer_runway_for_near_realtime_sources() {
+        let mut slow = startup_probe(8.0, Some(10.0));
+        slow.bytes = super::HEDGE_PROBE_BYTES;
+        slow.elapsed = Duration::from_secs_f64(slow.bytes as f64 * 8.0 / 8_000_000.0);
+        assert!(slow.is_unsustainable());
+
+        let mut near_realtime = startup_probe(9.9, Some(10.0));
+        near_realtime.bytes = super::HEDGE_PROBE_BYTES;
+        near_realtime.elapsed =
+            Duration::from_secs_f64(near_realtime.bytes as f64 * 8.0 / 9_900_000.0);
+        assert!(
+            near_realtime
+                .deficit_runway()
+                .is_some_and(|runway| runway > Duration::from_secs(60))
+        );
+        assert!(!near_realtime.is_unsustainable());
+    }
+
+    #[test]
+    fn auto_prebuffer_covers_the_remaining_throughput_deficit() {
+        let mut probe = startup_probe(11.0, Some(18.0));
+        probe.source_size_bytes = Some(18_000_000_000);
+        let plan = super::AutoPrebufferPlan::from_probe(&probe).unwrap();
+
+        assert_eq!(plan.target_bytes(), 18_000_000_000);
+
+        plan.estimated_goodput_bps
+            .store(
+                16_800_000.0f64.to_bits(),
+                std::sync::atomic::Ordering::Relaxed,
+            );
+        plan.rate_trusted
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+
+        assert!((2_879_000_000..=2_881_000_000).contains(&plan.target_bytes()));
+    }
+
+    #[test]
+    fn auto_prebuffer_keeps_a_minimum_runway_for_fast_sources() {
+        let mut probe = startup_probe(30.0, Some(18.0));
+        probe.source_size_bytes = Some(18_000_000_000);
+        let plan = super::AutoPrebufferPlan::from_probe(&probe).unwrap();
+        plan.estimated_goodput_bps
+            .store(
+                30_000_000.0f64.to_bits(),
+                std::sync::atomic::Ordering::Relaxed,
+            );
+        plan.rate_trusted
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+
+        assert_eq!(plan.target_bytes(), 135_000_000);
+    }
+
+    #[test]
+    fn auto_prebuffer_requires_a_complete_live_probe() {
+        let media = crate::db::Media::default();
+        let mut cached_only = startup_probe(1.0, Some(18.0));
+        cached_only.source_size_bytes = Some(18_000_000_000);
+        cached_only.bytes = super::HEDGE_PREFIX_BYTES;
+        let mut candidates = Vec::new();
+
+        assert!(!super::retain_prebuffer_candidate(
+            &mut candidates,
+            &media,
+            &cached_only,
+        ));
+
+        cached_only.bytes = super::HEDGE_PROBE_BYTES;
+        assert!(super::retain_prebuffer_candidate(
+            &mut candidates,
+            &media,
+            &cached_only,
+        ));
+    }
+
+    #[test]
+    fn average_bitrate_fallback_uses_size_and_runtime() {
+        let bitrate = super::average_bitrate_bps(9_000_000_000, 7_200.0)
+            .expect("valid size and runtime");
+        assert!((bitrate - 10_000_000.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn slow_auto_startup_requires_enough_observation_time() {
+        assert_eq!(
+            super::slow_auto_startup_ratio(Duration::from_secs(11), 6, Some(0), 1,),
+            None
+        );
+    }
+
+    #[test]
+    fn slow_auto_startup_detects_unsustainable_segment_production() {
+        let ratio =
+            super::slow_auto_startup_ratio(Duration::from_secs(36), 6, Some(0), 1)
+                .expect("one segment in 36 seconds is too slow");
+        assert!((ratio - (1.0 / 6.0)).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn slow_auto_startup_detects_no_initial_progress() {
+        assert_eq!(
+            super::slow_auto_startup_ratio(Duration::from_secs(18), 6, None, 0,),
+            Some(0.0)
+        );
+    }
+
+    #[test]
+    fn slow_auto_observation_scales_with_segment_length() {
+        assert_eq!(
+            super::slow_auto_observation_window(6),
+            Duration::from_secs(18)
+        );
+        assert_eq!(
+            super::slow_auto_observation_window(10),
+            Duration::from_secs(24)
+        );
+    }
+
+    #[test]
+    fn slow_auto_startup_accepts_real_time_production() {
+        assert_eq!(
+            super::slow_auto_startup_ratio(Duration::from_secs(24), 6, Some(3), 4,),
+            None
+        );
+    }
+
+    #[test]
+    fn slow_auto_startup_only_applies_to_early_playback() {
+        assert_eq!(
+            super::slow_auto_startup_ratio(Duration::from_secs(121), 6, Some(4), 5,),
+            None
+        );
+    }
+
     #[test]
     fn live_channel_forces_aac_over_copy() {
         assert_eq!(super::resolve_live_audio_codec(true, "copy"), "aac");
         assert_eq!(super::resolve_live_audio_codec(false, "copy"), "copy");
         assert_eq!(super::resolve_live_audio_codec(true, "aac"), "aac");
         assert_eq!(super::resolve_live_audio_codec(true, "ac3"), "ac3");
+    }
+
+    #[test]
+    fn hedged_source_rechecks_audio_copy_compatibility() {
+        assert_eq!(
+            super::resolve_source_audio_codec("copy", Some("aac")),
+            "copy"
+        );
+        assert_eq!(
+            super::resolve_source_audio_codec("copy", Some("opus")),
+            "aac"
+        );
+        assert_eq!(
+            super::resolve_source_audio_codec("copy", Some("dts")),
+            "aac"
+        );
+        assert_eq!(
+            super::resolve_source_audio_codec("aac", Some("opus")),
+            "aac"
+        );
+        assert_eq!(super::resolve_source_audio_codec("copy", None), "aac");
+    }
+
+    #[test]
+    fn changed_source_remaps_audio_by_language_instead_of_index() {
+        let source = crate::api::MediaSourceInfo {
+            media_streams: vec![
+                crate::api::MediaStream {
+                    type_: Some(crate::api::MediaStreamType::Audio),
+                    index: 1,
+                    language: Some("fra".to_string()),
+                    codec: Some("eac3".to_string()),
+                    is_default: Some(true),
+                    ..Default::default()
+                },
+                crate::api::MediaStream {
+                    type_: Some(crate::api::MediaStreamType::Audio),
+                    index: 3,
+                    language: Some("eng".to_string()),
+                    codec: Some("aac".to_string()),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+
+        let selected =
+            super::select_source_audio_stream(&source, Some(1), Some("en"), true)
+                .expect("English audio track");
+        assert_eq!(selected.index, 3);
+    }
+
+    #[test]
+    fn unchanged_source_preserves_explicit_audio_index() {
+        let source = crate::api::MediaSourceInfo {
+            media_streams: vec![
+                crate::api::MediaStream {
+                    type_: Some(crate::api::MediaStreamType::Audio),
+                    index: 1,
+                    language: Some("fra".to_string()),
+                    ..Default::default()
+                },
+                crate::api::MediaStream {
+                    type_: Some(crate::api::MediaStreamType::Audio),
+                    index: 3,
+                    language: Some("eng".to_string()),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+
+        let selected =
+            super::select_source_audio_stream(&source, Some(1), Some("en"), false)
+                .expect("explicit audio track");
+        assert_eq!(selected.index, 1);
     }
 
     #[test]

@@ -33,6 +33,130 @@ pub struct ItemsQueryResult {
     pub total_count: i64,
 }
 
+fn resolution_height_from_text(value: &str) -> Option<u16> {
+    let lower = value.to_ascii_lowercase();
+    for (needle, height) in [
+        ("4320p", 4320),
+        ("2160p", 2160),
+        ("1440p", 1440),
+        ("1080p", 1080),
+        ("720p", 720),
+        ("576p", 576),
+        ("480p", 480),
+        ("360p", 360),
+        ("240p", 240),
+    ] {
+        if lower.contains(needle) {
+            return Some(height);
+        }
+    }
+
+    lower
+        .split(|character: char| !character.is_ascii_alphanumeric())
+        .find_map(|token| match token {
+            "8k" => Some(4320),
+            "4k" | "uhd" => Some(2160),
+            // Torrent providers commonly use "2K" for the 1440p tier even
+            // though cinema 2K technically has a different pixel width.
+            "2k" => Some(1440),
+            _ => None,
+        })
+}
+
+fn source_resolution_height(source: &db::Media) -> Option<u16> {
+    resolution_height_from_text(&source.title).or_else(|| {
+        source
+            .stream_info
+            .as_ref()
+            .and_then(|info| {
+                [
+                    info.filename
+                        .as_deref(),
+                    info.name
+                        .as_deref(),
+                    info.description
+                        .as_deref(),
+                ]
+                .into_iter()
+                .flatten()
+                .find_map(resolution_height_from_text)
+            })
+    })
+}
+
+fn source_resolution_label(source: &db::Media) -> Option<&'static str> {
+    match source_resolution_height(source)? {
+        2160 => Some("4K"),
+        1440 => Some("1440p"),
+        1080 => Some("1080p"),
+        720 => Some("720p"),
+        480 => Some("480p"),
+        _ => None,
+    }
+}
+
+fn source_resolution_sort_key(source: &db::Media) -> (u8, u16) {
+    let height = source_resolution_height(source).unwrap_or(0);
+    let preferred_tier = match height {
+        1080 => 4,
+        1440 => 3,
+        2160 => 2,
+        720 => 1,
+        _ => 0,
+    };
+    (preferred_tier, height)
+}
+
+fn sort_stream_sources(sources: &mut [db::Media]) {
+    sources.sort_by(|left, right| {
+        let left_p2p = left
+            .stream_info
+            .as_ref()
+            .is_some_and(|info| info.is_p2p());
+        let right_p2p = right
+            .stream_info
+            .as_ref()
+            .is_some_and(|info| info.is_p2p());
+        match (left_p2p, right_p2p) {
+            (false, false) => return std::cmp::Ordering::Equal,
+            (false, true) => return std::cmp::Ordering::Less,
+            (true, false) => return std::cmp::Ordering::Greater,
+            (true, true) => {}
+        }
+
+        let left_auto = left
+            .title
+            .to_ascii_lowercase()
+            .ends_with("(auto)");
+        let right_auto = right
+            .title
+            .to_ascii_lowercase()
+            .ends_with("(auto)");
+        let auto = right_auto.cmp(&left_auto);
+        let resolution =
+            source_resolution_sort_key(right).cmp(&source_resolution_sort_key(left));
+        let left_seeders = left
+            .stream_info
+            .as_ref()
+            .and_then(|info| info.seeders)
+            .unwrap_or(0)
+            .max(0);
+        let right_seeders = right
+            .stream_info
+            .as_ref()
+            .and_then(|info| info.seeders)
+            .unwrap_or(0)
+            .max(0);
+
+        auto.then(resolution)
+            .then_with(|| right_seeders.cmp(&left_seeders))
+            .then_with(|| {
+                left.title
+                    .cmp(&right.title)
+            })
+    });
+}
+
 fn apply_permissions(item: &mut api::BaseItemDto, user: &db::User) {
     item.can_delete = Some(
         db::Media::can_delete(user)
@@ -1534,6 +1658,42 @@ pub async fn item(
     item_for_user(state, session, id, fields, None).await
 }
 
+async fn find_auto_parent(
+    ctx: &crate::AppContext,
+    auto_id: uuid::Uuid,
+) -> anyhow::Result<Option<uuid::Uuid>> {
+    if let Some(parent) = ctx
+        .store
+        .get::<uuid::Uuid>(auto_id.to_string())
+    {
+        return Ok(Some(*parent));
+    }
+    let rows = sqlx::query_as::<_, (String,)>(
+        "SELECT hex(id) FROM media WHERE kind IN ('movie','episode')",
+    )
+    .fetch_all(&ctx.db)
+    .await?;
+    for (id_hex,) in rows {
+        let id_str = format!(
+            "{}-{}-{}-{}-{}",
+            &id_hex[0..8],
+            &id_hex[8..12],
+            &id_hex[12..16],
+            &id_hex[16..20],
+            &id_hex[20..32]
+        )
+        .to_ascii_lowercase();
+        if let Ok(parent_id) = uuid::Uuid::parse_str(&id_str) {
+            if StreamService::auto_resolution(parent_id, auto_id).is_some() {
+                ctx.store
+                    .save(auto_id.to_string(), parent_id, std::time::Duration::MAX);
+                return Ok(Some(parent_id));
+            }
+        }
+    }
+    Ok(None)
+}
+
 async fn item_for_user(
     state: AppState,
     session: auth::AuthSession,
@@ -1567,6 +1727,8 @@ async fn item_for_user(
     // and then play MediaSources[0], so the requested group must end up first and
     // keep its own UUID instead of the item id stamped by `db_media_to_item`.
     let mut requested_group: Option<Uuid> = None;
+    // Handle synthetic "(auto)" ids: they are not persisted, but clients may fetch
+    // them as items (e.g. Users/{userId}/Items/{autoId}). Resolve to parent Movie/Episode.
     let resolved_id = match MediaResolveService::resolve_item(id, &state.ctx).await? {
         Some(m) if m.kind == db::MediaKind::StreamGroup => {
             requested_group = Some(m.id);
@@ -1586,7 +1748,14 @@ async fn item_for_user(
             .context_not_found("stream group not yet associated with an item")?
         }
         Some(m) => m.id,
-        None => return Ok(None),
+        None => {
+            // Try to interpret as synthetic auto id: "<parent>-auto-<res>"
+            if let Some(parent) = find_auto_parent(&state.ctx, id).await? {
+                parent
+            } else {
+                return Ok(None);
+            }
+        }
     };
     let mut media = db::Media::get_by_filter(
         &state
@@ -1698,8 +1867,90 @@ async fn item_for_user(
                 );
             }
         }
-        // The other versions stay in the list so the version picker is complete.
         let mut filtered = filtered;
+        // Explicit stream-group lookups represent a concrete version and must
+        // return only group-backed sources. Synthetic Auto choices belong on
+        // the normal item response where no version has been chosen yet.
+        if requested_group.is_none() {
+            // Inject "(auto)" for every resolution tier (4K,1080p,720p,etc.)
+            use std::collections::{BTreeMap, HashSet};
+            let mut groups: BTreeMap<String, Vec<db::Media>> = BTreeMap::new();
+            for m in filtered
+                .iter()
+                .cloned()
+            {
+                if !m
+                    .stream_info
+                    .as_ref()
+                    .is_some_and(|info| info.is_p2p())
+                {
+                    continue;
+                }
+                if m.title
+                    .contains("(auto)")
+                {
+                    continue;
+                }
+                let Some(key) = source_resolution_label(&m) else {
+                    continue;
+                };
+                groups
+                    .entry(key.to_string())
+                    .or_default()
+                    .push(m);
+            }
+            let mut autos: Vec<db::Media> = Vec::new();
+            let existing_ids: HashSet<uuid::Uuid> = filtered
+                .iter()
+                .map(|m| m.id)
+                .collect();
+            for (res, group) in groups {
+                if group.len() < 2 {
+                    continue;
+                }
+                let auto_label = format!("{} (auto)", res);
+                if filtered
+                    .iter()
+                    .any(|m| m.title == auto_label)
+                {
+                    continue;
+                }
+                let auto_id = StreamService::auto_source_id(media.id, &res);
+                if existing_ids.contains(&auto_id) {
+                    continue;
+                }
+                let mut auto_media = group[0].clone();
+                auto_media.id = auto_id;
+                auto_media.title = auto_label.clone();
+                if let Some(ref mut si) = auto_media.stream_info {
+                    // Auto represents a live selection strategy rather than a
+                    // single swarm, so it has no meaningful seed count.
+                    si.seeders = None;
+                    si.name = Some("auto".to_string());
+                }
+                auto_media.probe_data = None;
+                auto_media.group_id = None;
+                // Persist mapping so Items/{autoId} can be resolved without scanning all movies
+                state
+                    .ctx
+                    .store
+                    .save(auto_id.to_string(), media.id, std::time::Duration::MAX);
+                autos.push(auto_media);
+            }
+            filtered.extend(autos);
+            if filtered
+                .iter()
+                .any(|source| {
+                    source
+                        .stream_info
+                        .as_ref()
+                        .is_some_and(|info| info.is_p2p())
+                })
+            {
+                sort_stream_sources(&mut filtered);
+            }
+        }
+        // The other versions stay in the list so the version picker is complete.
         if let Some(gid) = requested_group {
             match filtered
                 .iter()
@@ -3377,6 +3628,7 @@ pub async fn media_segments(
 
 #[cfg(test)]
 mod tests {
+    use super::{sort_stream_sources, source_resolution_height};
     use chrono::Utc;
     use http::header::HeaderValue;
     use remux_sdks::remux::{
@@ -3392,6 +3644,120 @@ mod tests {
             insert_test_source_of_kind,
         },
     };
+
+    fn torrent_source(title: &str, filename: &str, seeders: i64) -> db::Media {
+        db::Media {
+            title: title.to_string(),
+            kind: db::MediaKind::Stream,
+            stream_info: Some(crate::stream::StreamInfo {
+                descriptor: crate::stream::StreamDescriptor::Torrent {
+                    info_hash: "a".repeat(40),
+                    file_hint: Some(filename.to_string()),
+                    file_idx: None,
+                    trackers: Vec::new(),
+                },
+                filename: Some(filename.to_string()),
+                seeders: Some(seeders),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn stream_sources_put_all_auto_choices_before_resolution_and_seed_sort() {
+        let mut sources = vec![
+            torrent_source("Torrentio 720p", "Movie.720p.mkv", 2_000),
+            torrent_source("Torrentio 1080p", "Movie.1080p.mkv", 12),
+            torrent_source("4K (auto)", "Movie.2160p.mkv", 10_040),
+            torrent_source("Torrentio 4k", "Movie.2160p.mkv", 40),
+            torrent_source("1080p (auto)", "Movie.1080p.mkv", 10_500),
+            torrent_source("1440p (auto)", "Movie.1440p.mkv", 10_200),
+            torrent_source("720p (auto)", "Movie.720p.mkv", 12_000),
+            torrent_source("Torrentio 2k", "Movie.2k.mkv", 70),
+            torrent_source("Torrentio 1080p", "Movie.1080p.mkv", 500),
+            torrent_source("Torrentio", "Movie.unknown.mkv", 9_000),
+        ];
+
+        sort_stream_sources(&mut sources);
+
+        assert_eq!(
+            sources
+                .iter()
+                .map(|source| source
+                    .title
+                    .as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "1080p (auto)",
+                "1440p (auto)",
+                "4K (auto)",
+                "720p (auto)",
+                "Torrentio 1080p",
+                "Torrentio 1080p",
+                "Torrentio 2k",
+                "Torrentio 4k",
+                "Torrentio 720p",
+                "Torrentio",
+            ]
+        );
+        assert_eq!(
+            sources[4]
+                .stream_info
+                .as_ref()
+                .and_then(|info| info.seeders),
+            Some(500)
+        );
+    }
+
+    #[test]
+    fn stream_sources_keep_direct_sources_ahead_of_torrent_choices() {
+        let local = db::Media {
+            title: "Local file".to_string(),
+            kind: db::MediaKind::Stream,
+            stream_info: Some(crate::stream::StreamInfo {
+                descriptor: crate::stream::StreamDescriptor::Local("movie.mkv".into()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let debrid = db::Media {
+            title: "Real-Debrid 4K".to_string(),
+            kind: db::MediaKind::Stream,
+            stream_info: Some(crate::stream::StreamInfo {
+                descriptor: crate::stream::StreamDescriptor::http(
+                    "https://example.invalid/movie.mkv",
+                ),
+                service_id: Some("real-debrid".to_string()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let mut sources = vec![
+            torrent_source("1080p (auto)", "Movie.1080p.mkv", 0),
+            local.clone(),
+            torrent_source("Torrentio 1080p", "Movie.1080p.mkv", 500),
+            debrid.clone(),
+        ];
+
+        sort_stream_sources(&mut sources);
+
+        assert_eq!(sources[0].id, local.id);
+        assert_eq!(sources[1].id, debrid.id);
+        assert_eq!(sources[2].title, "1080p (auto)");
+        assert_eq!(sources[3].title, "Torrentio 1080p");
+    }
+
+    #[test]
+    fn explicit_resolution_wins_over_release_group_containing_4k() {
+        let source = torrent_source(
+            "Torrentio 1080p",
+            "Movie.2026.1080p.WEB.x265-Wolfmax4k.mkv",
+            10,
+        );
+
+        assert_eq!(source_resolution_height(&source), Some(1080));
+    }
 
     async fn get_user_id(server: &axum_test::TestServer, auth: &str) -> String {
         let resp: serde_json::Value = server

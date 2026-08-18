@@ -362,7 +362,7 @@ impl From<db::Media> for api::MediaSourceInfo {
         let is_stub = descriptor
             .and_then(|d| d.as_http_url())
             .is_none();
-        let container = source
+        let mut container = source
             .probe_data
             .as_ref()
             .and_then(|p| {
@@ -374,6 +374,27 @@ impl From<db::Media> for api::MediaSourceInfo {
                     .and_then(|d| d.as_http_url())
                     .and_then(infer_container_from_url)
             });
+        // For (auto) synthetic entries, ensure a container so the web player doesn't reject the source locally
+        if container.is_none()
+            && source
+                .title
+                .ends_with("(auto)")
+        {
+            container = source
+                .stream_info
+                .as_ref()
+                .and_then(|si| {
+                    si.filename
+                        .as_deref()
+                })
+                .and_then(|f| {
+                    std::path::Path::new(f)
+                        .extension()
+                        .and_then(|e| e.to_str())
+                        .map(|e| e.to_ascii_lowercase())
+                })
+                .or(Some("mkv".to_string()));
+        }
 
         let remux = Some(api::MediaSourceRemuxInfo {
             provider_info: source
@@ -493,6 +514,95 @@ impl From<db::Media> for api::MediaSourceInfo {
                 ..Default::default()
             }];
         }
+        // Synthetic Auto and unprobed P2P sources lack authoritative probe
+        // metadata. Supply conservative video/audio descriptors so clients
+        // enter the PlaybackInfo and HLS paths, where the actual source is
+        // validated and converted.
+        let is_auto = source
+            .title
+            .ends_with("(auto)");
+        let is_p2p_unprobed = media_streams.is_empty()
+            && source
+                .stream_info
+                .as_ref()
+                .map_or(false, |si| si.is_p2p());
+        if (is_auto || is_p2p_unprobed) && media_streams.is_empty() {
+            // Providers encode resolution in either the display title or
+            // filename, so inspect both before falling back to 1080p.
+            let lower = source
+                .title
+                .to_ascii_lowercase();
+            let fname_lower = source
+                .stream_info
+                .as_ref()
+                .and_then(|si| {
+                    si.filename
+                        .as_deref()
+                })
+                .map(|f| f.to_ascii_lowercase())
+                .unwrap_or_default();
+            let combined = format!("{} {}", lower, fname_lower);
+            let (w, h, label) = if combined.contains("2160p") || combined.contains("4k")
+            {
+                (Some(3840), Some(2160), "4K H264")
+            } else if combined.contains("1080p") {
+                (Some(1920), Some(1080), "1080p H264")
+            } else if combined.contains("720p") {
+                (Some(1280), Some(720), "720p H264")
+            } else if combined.contains("480p") {
+                (Some(720), Some(480), "480p H264")
+            } else if combined.contains("1440p") {
+                (Some(2560), Some(1440), "1440p H264")
+            } else if source
+                .title
+                .starts_with("4K")
+            {
+                (Some(3840), Some(2160), "4K H264")
+            } else if source
+                .title
+                .starts_with("1080p")
+            {
+                (Some(1920), Some(1080), "1080p H264")
+            } else if source
+                .title
+                .starts_with("720p")
+            {
+                (Some(1280), Some(720), "720p H264")
+            } else if source
+                .title
+                .starts_with("480p")
+            {
+                (Some(720), Some(480), "480p H264")
+            } else if source
+                .title
+                .starts_with("1440p")
+            {
+                (Some(2560), Some(1440), "1440p H264")
+            } else {
+                (Some(1920), Some(1080), "1080p H264")
+            };
+            media_streams = vec![
+                api::MediaStream {
+                    type_: Some(api::MediaStreamType::Video),
+                    codec: Some("h264".to_string()),
+                    is_default: Some(true),
+                    display_title: Some(label.to_string()),
+                    width: w,
+                    height: h,
+                    index: 0,
+                    ..Default::default()
+                },
+                api::MediaStream {
+                    type_: Some(api::MediaStreamType::Audio),
+                    codec: Some("aac".to_string()),
+                    channels: Some(2),
+                    is_default: Some(true),
+                    display_title: Some("Audio".to_string()),
+                    index: 1,
+                    ..Default::default()
+                },
+            ];
+        }
         api::MediaSourceInfo {
             id: client_id,
             e_tag: client_id,
@@ -502,7 +612,16 @@ impl From<db::Media> for api::MediaSourceInfo {
             name: Some(display_name),
             container,
             remux,
-            has_segments: !is_stub,
+            has_segments: if is_auto
+                || source
+                    .stream_info
+                    .as_ref()
+                    .map_or(false, |si| si.is_p2p())
+            {
+                true
+            } else {
+                !is_stub
+            },
             formats: Some(vec![]),
             required_http_headers: Some(HashMap::new()),
             run_time_ticks,

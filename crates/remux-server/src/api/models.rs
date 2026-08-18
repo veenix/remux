@@ -1047,8 +1047,15 @@ pub fn db_media_to_item(media: db::Media, hide_sources: bool) -> BaseItemDto {
                     .into_iter()
                     .map(MediaSourceInfo::from)
                     .collect();
-                // Clients expect the first source's ID to equal the parent item's ID.
-                if !infos.is_empty() {
+                // Clients expect the first source's ID to equal the parent item's ID,
+                // but not for synthetic "(auto)" entries — their UUID must be preserved
+                // so the version picker can round-trip the correct MediaSourceId.
+                if !infos.is_empty()
+                    && !infos[0]
+                        .name
+                        .as_ref()
+                        .is_some_and(|n| n.contains("(auto)"))
+                {
                     infos[0].id = media.id;
                     infos[0].e_tag = media.id;
                 }

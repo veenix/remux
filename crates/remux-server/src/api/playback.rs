@@ -127,6 +127,24 @@ fn apply_item_runtime_fallback(
         .and_then(|seconds| seconds.to_ticks(TickUnit::Seconds));
 }
 
+fn clear_initial_auto_audio_placeholder(
+    query: &mut api::PlaybackInfoQuery,
+    is_auto: bool,
+) {
+    // Before Auto resolves, the detail page can only expose a synthetic
+    // "Audio 1" track. Its numeric index has no relationship to the chosen
+    // release, so treating it as an explicit user choice can select the wrong
+    // language. Once playback has a position, track changes are real choices.
+    if is_auto
+        && query
+            .start_time_ticks
+            .unwrap_or(0)
+            <= 0
+    {
+        query.audio_stream_index = None;
+    }
+}
+
 fn playback_original_language(
     item: Option<&db::Media>,
     selected_source_language: Option<String>,
@@ -143,7 +161,7 @@ async fn items_playbackinfo_inner(
     state: AppState,
     session: auth::AuthSession,
     id: Uuid,
-    q: api::PlaybackInfoQuery,
+    mut q: api::PlaybackInfoQuery,
 ) -> Result<impl IntoResponse> {
     let media_source_id = q.media_source_id;
     let play_session_id = common::get_uuid()
@@ -189,17 +207,251 @@ async fn items_playbackinfo_inner(
     .await
     .unwrap_or_default();
 
-    let media =
-        MediaResolveService::resolve_item(media_source_id.unwrap_or(id), &state.ctx)
-            .await?
-            .context_not_found("not found")?;
+    let mut auto_requested: Option<uuid::Uuid> = None;
+    let mut media = match MediaResolveService::resolve_item(
+        media_source_id.unwrap_or(id),
+        &state.ctx,
+    )
+    .await?
+    {
+        Some(m) => {
+            // A synthetic Auto id may resolve through the store to a parent or
+            // previous winner. Preserve the requested id for the response, then
+            // select a current candidate for its exact resolution tier.
+            let mut resolved = m;
+            if let Some(req) = media_source_id {
+                if resolved.id != req {
+                    if let Some(res) = StreamService::auto_resolution(id, req) {
+                        auto_requested = Some(req);
+                        // Store mappings accelerate lookup but do not replace
+                        // current availability-based source selection.
+                        if let Ok(w) = crate::services::StreamService::resolve_auto(
+                            &state.ctx,
+                            id,
+                            res,
+                            Some(
+                                session
+                                    .user
+                                    .id,
+                            ),
+                        )
+                        .await
+                        {
+                            state
+                                .ctx
+                                .store
+                                .save(req.to_string(), w.id, std::time::Duration::MAX);
+                            resolved = w;
+                        } else {
+                            state
+                                .ctx
+                                .store
+                                .save(
+                                    req.to_string(),
+                                    resolved.id,
+                                    std::time::Duration::MAX,
+                                );
+                        }
+                    } else if let Some(parent) = state
+                        .ctx
+                        .store
+                        .get::<uuid::Uuid>(req.to_string())
+                    {
+                        if *parent == resolved.id {
+                            auto_requested = Some(req);
+                        }
+                    }
+                }
+            }
+            resolved
+        }
+        None => {
+            // Synthetic Auto ids are deterministic rather than persisted.
+            // Recover the resolution tier from the requested id.
+            let Some(req) = media_source_id else {
+                return Err(anyhow::anyhow!("not found").context_not_found("not found"));
+            };
+            if let Some(res) = StreamService::auto_resolution(id, req) {
+                auto_requested = Some(req);
+                state
+                    .ctx
+                    .store
+                    .save(req.to_string(), id, std::time::Duration::MAX);
+                // Resolve the synthetic Auto source to a concrete live candidate.
+                match crate::services::StreamService::resolve_auto(
+                    &state.ctx,
+                    id,
+                    res,
+                    Some(
+                        session
+                            .user
+                            .id,
+                    ),
+                )
+                .await
+                {
+                    Ok(w) => w,
+                    Err(_) => db::Media {
+                        id: req,
+                        title: format!("{} (auto)", res),
+                        kind: db::MediaKind::Stream,
+                        ..Default::default()
+                    },
+                }
+            } else {
+                return Err(anyhow::anyhow!("not found").context_not_found("not found"));
+            }
+        }
+    };
 
+    // A placeholder may be returned while discovery is incomplete. Preserve
+    // its parent mapping and retry live selection before building PlaybackInfo.
+    media = {
+        let mut m = media;
+        if m.title
+            .ends_with("(auto)")
+        {
+            auto_requested = Some(m.id);
+            if state
+                .ctx
+                .store
+                .get::<uuid::Uuid>(m.id.to_string())
+                .is_none()
+            {
+                state
+                    .ctx
+                    .store
+                    .save(m.id.to_string(), id, std::time::Duration::MAX);
+            }
+            let res = m
+                .title
+                .trim_end_matches(" (auto)")
+                .trim()
+                .to_string();
+            if let Ok(w) = crate::services::StreamService::resolve_auto(
+                &state.ctx,
+                id,
+                &res,
+                Some(
+                    session
+                        .user
+                        .id,
+                ),
+            )
+            .await
+            {
+                w
+            } else {
+                m
+            }
+        } else {
+            m
+        }
+    };
+
+    // When every available source is P2P, use the 1080p Auto tier as the
+    // latency-oriented default. A local, HTTP/debrid, RTSP, or OpenDAL source
+    // must retain its existing priority instead of being replaced implicitly.
+    let default_to_auto = if media_source_id.is_none()
+        && matches!(media.kind, db::MediaKind::Movie | db::MediaKind::Episode)
+    {
+        let root_is_direct = media
+            .stream_info
+            .as_ref()
+            .is_some_and(|info| !info.is_p2p());
+        let mut sources = media
+            .streams(
+                &state
+                    .ctx
+                    .db,
+            )
+            .await?;
+
+        // Cached direct sources already prove that Auto must not replace the
+        // normal default. The StreamService load below performs their usual
+        // authoritative refresh once; avoid adding a second provider wait here.
+        if !root_is_direct && sources.is_empty() {
+            state
+                .ctx
+                .addons
+                .refresh_streams(
+                    &mut media,
+                    &state.ctx,
+                    Some(
+                        session
+                            .user
+                            .id,
+                    ),
+                )
+                .await
+                .inspect_err(|error| {
+                    tracing::warn!(%error, item_id = %id, "failed to refresh sources before default selection")
+                })
+                .ok();
+            sources = media
+                .streams(
+                    &state
+                        .ctx
+                        .db,
+                )
+                .await?;
+        }
+
+        !root_is_direct
+            && !sources.is_empty()
+            && sources
+                .iter()
+                .all(|source| {
+                    source
+                        .stream_info
+                        .as_ref()
+                        .is_some_and(|info| info.is_p2p())
+                })
+    } else {
+        false
+    };
+    if default_to_auto {
+        if let Ok(w) = crate::services::StreamService::resolve_auto(
+            &state.ctx,
+            id,
+            "1080p",
+            Some(
+                session
+                    .user
+                    .id,
+            ),
+        )
+        .await
+        {
+            auto_requested = Some(uuid::Uuid::new_v5(
+                &uuid::Uuid::NAMESPACE_URL,
+                format!("{}-auto-1080p", id).as_bytes(),
+            ));
+            media = w;
+        }
+    }
+
+    // StreamService operates on the concrete candidate while the response keeps
+    // the synthetic id expected by the client.
+    let effective_requested_id = if media
+        .title
+        .ends_with("(auto)")
+    {
+        // Preserve the placeholder id if live resolution is still unavailable.
+        Some(media.id)
+    } else if media.id != id && Some(media.id) != media_source_id {
+        // Use the concrete winner selected for the Auto tier.
+        Some(media.id)
+    } else {
+        media_source_id
+    };
+    let winner_id = media.id;
     let mut service = StreamService::new(StreamServiceConfig {
         ctx: state
             .ctx
             .clone(),
         item_id: id,
-        requested_id: media_source_id,
+        requested_id: effective_requested_id,
         show_ungrouped,
         stream_filter: session
             .user
@@ -221,7 +473,7 @@ async fn items_playbackinfo_inner(
         .original_language
         .clone();
     service
-        .load(media)
+        .load(media.clone())
         .await?;
     // Load the top-level Movie/Episode for subtitle lookup.
     // `id` is always the movie/episode UUID; `media_source_id` may point to a
@@ -287,6 +539,7 @@ async fn items_playbackinfo_inner(
             .results
             .len(),
     );
+    let mut auto_session_winner_id = auto_requested.map(|_| winner_id);
 
     // Per-user playback preferences + remembered selections, resolved per source
     // via `MediaSourceInfo::resolve_default_streams` (see below).
@@ -311,12 +564,19 @@ async fn items_playbackinfo_inner(
         &id,
     )
     .await;
+    clear_initial_auto_audio_placeholder(&mut q, auto_requested.is_some());
 
-    for ProbeResult {
-        mut source,
-        stream,
-        effective_stream,
-    } in probed.results
+    for (
+        result_index,
+        ProbeResult {
+            mut source,
+            stream,
+            effective_stream,
+        },
+    ) in probed
+        .results
+        .into_iter()
+        .enumerate()
     {
         // Metadata-only torrent probes may not know the container duration yet.
         // Keep the authoritative Movie/Episode duration in PlaybackInfo so
@@ -355,6 +615,23 @@ async fn items_playbackinfo_inner(
             ) {
                 reasons.insert(api::TranscodeReason::ContainerNotSupported(
                     "rtsp".to_string(),
+                ));
+            }
+            // Torrent (P2P) sources must be transcoded via HLS so the server can
+            // download/stream the content; direct-play would require the client to
+            // fetch the torrent directly which browsers cannot do. Force HLS with
+            // video transcode to H.264 for broad MSE compatibility; HEVC and AV1
+            // direct copy are not consistently supported by browser players.
+            if stream
+                .stream_info
+                .as_ref()
+                .map_or(false, |si| si.is_p2p())
+            {
+                reasons.insert(api::TranscodeReason::ContainerNotSupported(
+                    "p2p requires transcode".to_string(),
+                ));
+                reasons.insert(api::TranscodeReason::VideoCodecNotSupported(
+                    "p2p requires h264".to_string(),
                 ));
             }
             reasons
@@ -525,7 +802,31 @@ async fn items_playbackinfo_inner(
         }
 
         sidecar_subtitle_routes.push((subtitle_source_id, routes));
+        if auto_requested.is_some() && media_sources.is_empty() {
+            auto_session_winner_id = Some(effective_stream.id);
+        }
         media_sources.push(source);
+    }
+
+    if !media_sources.is_empty() {
+        if let (Some(auto_id), Some(winner_id)) =
+            (auto_requested, auto_session_winner_id)
+        {
+            StreamService::pin_auto_session_winner(
+                &state
+                    .ctx
+                    .store,
+                &play_session_id,
+                id,
+                auto_id,
+                winner_id,
+                Some(
+                    session
+                        .user
+                        .id,
+                ),
+            );
+        }
     }
 
     // Inject external subtitles from AIO (cache-backed)
@@ -576,12 +877,65 @@ async fn items_playbackinfo_inner(
             .id,
     );
 
-    // When no specific stream was requested (initial load, or media_source_id == item_id),
-    // override source[0].Id to equal the item ID — clients expect this for auto-play.
-    // Group and specific-stream requests keep their own UUIDs (specific_stream_requested = true).
-    if !specific_stream_requested && !media_sources.is_empty() {
+    // Preserve the synthetic Auto id so the client can correlate PlaybackInfo
+    // with its requested source while the server uses the concrete winner.
+    if let Some(auto_id) = auto_requested {
+        for s in &mut media_sources {
+            let concrete_id = s.id;
+            s.id = auto_id;
+            s.e_tag = auto_id;
+            for stream in &mut s.media_streams {
+                if let Some(url) = stream
+                    .delivery_url
+                    .as_mut()
+                {
+                    *url = url.replace(&concrete_id.to_string(), &auto_id.to_string());
+                }
+            }
+            // HLS requests must carry the same synthetic id returned in the
+            // MediaSourceInfo response.
+            if let Some(url) = s
+                .transcoding_url
+                .as_mut()
+            {
+                // Replace the query value directly instead of assuming it still
+                // contains the current concrete winner.
+                if url.contains("MediaSourceId=") {
+                    let mut new_url = url.clone();
+                    if let Some(start) = new_url.find("MediaSourceId=") {
+                        let after = start + "MediaSourceId=".len();
+                        if let Some(end) = new_url[after..]
+                            .find('&')
+                            .map(|e| after + e)
+                            .or(Some(new_url.len()))
+                        {
+                            new_url.replace_range(after..end, &auto_id.to_string());
+                            *url = new_url;
+                        }
+                    }
+                    // Some URL shapes embed the concrete id outside the parsed
+                    // query parameter.
+                    if url.contains(&winner_id.to_string()) {
+                        *url =
+                            url.replace(&winner_id.to_string(), &auto_id.to_string());
+                    }
+                } else {
+                    *url = url.replace(&winner_id.to_string(), &auto_id.to_string());
+                }
+            }
+        }
+    } else if !specific_stream_requested && !media_sources.is_empty() {
+        let concrete_id = media_sources[0].id;
         media_sources[0].id = id;
         media_sources[0].e_tag = id;
+        for stream in &mut media_sources[0].media_streams {
+            if let Some(url) = stream
+                .delivery_url
+                .as_mut()
+            {
+                *url = url.replace(&concrete_id.to_string(), &id.to_string());
+            }
+        }
     }
 
     for (source, (delivery_source_id, routes)) in media_sources
@@ -887,6 +1241,9 @@ async fn videos_stream_inner(
     else {
         return Ok(no_streams_response().into_response());
     };
+    let fallback_file_hint = si
+        .filename
+        .clone();
     let descriptor = si.descriptor;
 
     // Direct play: serve bytes directly through the StreamSource trait.
@@ -926,6 +1283,78 @@ async fn videos_stream_inner(
                 .context_not_found("addon does not support streams")?
                 .serve_stream(&descriptor, &headers)
                 .await?
+        } else if let crate::stream::StreamDescriptor::Torrent {
+            info_hash,
+            file_hint,
+            file_idx,
+            trackers,
+        } = &descriptor
+        {
+            let cfg = db::Settings::get_config_or_default(
+                &state
+                    .ctx
+                    .db,
+            )
+            .await;
+            if !cfg
+                .p2p_enabled
+                .unwrap_or(true)
+            {
+                return Err(anyhow!("P2P disabled")).context_bad_request(
+                    "P2P streams are disabled by the server administrator",
+                );
+            }
+            let mut playback_ids = state
+                .ctx
+                .sessions
+                .playback_ids_for_media_source(media.id)
+                .await;
+            if let Some(play_session_id) = q
+                .play_session_id
+                .clone()
+                .or_else(|| {
+                    q.device_id
+                        .as_deref()
+                        .and_then(|device_id| {
+                            state
+                                .ctx
+                                .sessions
+                                .get_by_device(device_id)
+                                .map(|session| session.play_session_id)
+                        })
+                })
+            {
+                if state
+                    .ctx
+                    .sessions
+                    .get(&play_session_id)
+                    .is_some()
+                {
+                    state
+                        .ctx
+                        .sessions
+                        .update(&play_session_id, |session| {
+                            session.media_source_id = Some(
+                                media
+                                    .id
+                                    .to_string(),
+                            );
+                        });
+                    if !playback_ids.contains(&play_session_id) {
+                        playback_ids.push(play_session_id);
+                    }
+                }
+            }
+            crate::stream::TorrentSource {
+                info_hash: info_hash.clone(),
+                file_hint: file_hint
+                    .clone()
+                    .or(fallback_file_hint),
+                file_idx: *file_idx,
+                trackers: trackers.clone(),
+            }
+            .serve_for_playback(&state, &headers, &playback_ids)
+            .await?
         } else {
             descriptor
                 .clone()
@@ -1210,7 +1639,7 @@ mod tests {
     use crate::integration_test::{
         AUTH_HEADER, assert_api_keys_are_real, auth_header_with_token,
         authenticated_server, insert_test_source, insert_test_source_of_kind,
-        insert_test_source_with_external_subtitle, new_test_server,
+        insert_test_source_with_external_subtitle, new_test_server, seed_movie,
     };
 
     #[test]
@@ -1232,6 +1661,37 @@ mod tests {
         super::apply_item_runtime_fallback(&mut source, Some(142));
 
         assert_eq!(source.run_time_ticks, Some(900_000_000));
+    }
+
+    #[test]
+    fn initial_auto_audio_index_is_treated_as_a_placeholder() {
+        let mut query = crate::api::PlaybackInfoQuery {
+            audio_stream_index: Some(1),
+            start_time_ticks: Some(0),
+            ..Default::default()
+        };
+
+        super::clear_initial_auto_audio_placeholder(&mut query, true);
+
+        assert_eq!(query.audio_stream_index, None);
+    }
+
+    #[test]
+    fn manual_and_in_play_audio_selections_remain_explicit() {
+        let mut manual = crate::api::PlaybackInfoQuery {
+            audio_stream_index: Some(2),
+            ..Default::default()
+        };
+        super::clear_initial_auto_audio_placeholder(&mut manual, false);
+        assert_eq!(manual.audio_stream_index, Some(2));
+
+        let mut in_play = crate::api::PlaybackInfoQuery {
+            audio_stream_index: Some(1),
+            start_time_ticks: Some(10_000_000),
+            ..Default::default()
+        };
+        super::clear_initial_auto_audio_placeholder(&mut in_play, true);
+        assert_eq!(in_play.audio_stream_index, Some(1));
     }
 
     #[test]
@@ -2594,6 +3054,180 @@ mod tests {
                 .simple()
                 .to_string(),
             "without MediaSourceId, ETag must equal the item id"
+        );
+    }
+
+    #[tokio::test]
+    async fn playbackinfo_without_source_id_preserves_direct_default_in_mixed_catalog()
+    {
+        use crate::{services::StreamService, stream::StreamDescriptor};
+
+        let (server, guard, token) = authenticated_server().await;
+        let auth = auth_header_with_token(&token);
+        let ctx = &guard.0;
+        let now = chrono::Utc::now().naive_utc();
+        let movie = seed_movie(ctx).await;
+        sqlx::query("UPDATE media SET streams_refreshed_at = ? WHERE id = ?")
+            .bind(now)
+            .bind(movie.id)
+            .execute(&ctx.db)
+            .await
+            .expect("mark streams fresh");
+
+        let mut local = insert_test_source(ctx).await;
+        local.id = uuid::Uuid::new_v4();
+        local.title = "Local 1080p".to_string();
+        local.parent_id = Some(movie.id);
+        local.idx = Some(0);
+        local.updated_at = now;
+        local
+            .save(&ctx.db)
+            .await
+            .expect("save local source");
+
+        let mut torrent = local.clone();
+        torrent.id = uuid::Uuid::new_v4();
+        torrent.title = "Torrentio 1080p".to_string();
+        torrent.idx = Some(1);
+        let info = torrent
+            .stream_info
+            .as_mut()
+            .expect("test source stream info");
+        info.descriptor = StreamDescriptor::Torrent {
+            info_hash: "0123456789abcdef0123456789abcdef01234567".to_string(),
+            file_hint: Some("torrent-candidate.mp4".to_string()),
+            file_idx: Some(0),
+            trackers: vec![],
+        };
+        info.filename = Some("torrent-candidate.1080p.mp4".to_string());
+        info.seeders = Some(100);
+        torrent
+            .save(&ctx.db)
+            .await
+            .expect("save torrent source");
+        StreamService::remember_auto_choice(&ctx.store, movie.id, "1080p", torrent.id);
+
+        let mut stored_movie = crate::db::Media::get_by_id(&ctx.db, &movie.id)
+            .await
+            .expect("load movie")
+            .expect("stored movie");
+        let stored_sources = stored_movie
+            .streams(&ctx.db)
+            .await
+            .expect("load sources");
+        assert_eq!(stored_sources.len(), 2);
+        assert_eq!(stored_sources[0].id, local.id);
+        assert!(
+            stored_sources
+                .iter()
+                .any(|source| {
+                    source
+                        .stream_info
+                        .as_ref()
+                        .is_some_and(|info| !info.is_p2p())
+                })
+        );
+
+        let response = server
+            .post(&format!("/items/{}/playbackinfo", movie.id))
+            .add_header(
+                http::header::AUTHORIZATION,
+                HeaderValue::from_str(&auth).unwrap(),
+            )
+            .json(&json!({}))
+            .await;
+        response.assert_status_ok();
+        let body: serde_json::Value = response.json();
+        let path = body["MediaSources"][0]["Path"]
+            .as_str()
+            .expect("media source path");
+
+        assert!(
+            path.contains(
+                &local
+                    .id
+                    .to_string()
+            ),
+            "an omitted MediaSourceId should preserve local {}; torrent {}; got {path}",
+            local.id,
+            torrent.id,
+        );
+        assert!(
+            !path.contains(
+                &torrent
+                    .id
+                    .to_string()
+            )
+        );
+
+        crate::db::Media::delete(&ctx.db, &local.id)
+            .await
+            .expect("remove local source");
+        let mut debrid = insert_test_source(ctx).await;
+        debrid.id = uuid::Uuid::new_v4();
+        debrid.title = "Real-Debrid 1080p".to_string();
+        debrid.parent_id = Some(movie.id);
+        debrid.idx = Some(0);
+        debrid.updated_at = now;
+        let info = debrid
+            .stream_info
+            .as_mut()
+            .expect("test source stream info");
+        info.descriptor = StreamDescriptor::http("https://example.invalid/movie.mp4");
+        info.filename = Some("debrid-default.1080p.mp4".to_string());
+        info.service_id = Some("real-debrid".to_string());
+        debrid
+            .save(&ctx.db)
+            .await
+            .expect("save debrid source");
+
+        let debrid_response = server
+            .post(&format!("/items/{}/playbackinfo", movie.id))
+            .add_header(
+                http::header::AUTHORIZATION,
+                HeaderValue::from_str(&auth).unwrap(),
+            )
+            .json(&json!({}))
+            .await;
+        debrid_response.assert_status_ok();
+        let debrid_body: serde_json::Value = debrid_response.json();
+        let debrid_path = debrid_body["MediaSources"][0]["Path"]
+            .as_str()
+            .expect("debrid media source path");
+        assert!(
+            debrid_path.contains(
+                &debrid
+                    .id
+                    .to_string()
+            ),
+            "an omitted MediaSourceId should preserve debrid {}; torrent {}; got {debrid_path}",
+            debrid.id,
+            torrent.id,
+        );
+
+        crate::db::Media::delete(&ctx.db, &debrid.id)
+            .await
+            .expect("remove debrid source");
+        let torrent_only_response = server
+            .post(&format!("/items/{}/playbackinfo", movie.id))
+            .add_header(
+                http::header::AUTHORIZATION,
+                HeaderValue::from_str(&auth).unwrap(),
+            )
+            .json(&json!({}))
+            .await;
+        torrent_only_response.assert_status_ok();
+        let torrent_only_body: serde_json::Value = torrent_only_response.json();
+        let torrent_only_path = torrent_only_body["MediaSources"][0]["Path"]
+            .as_str()
+            .expect("torrent media source path");
+        assert!(
+            torrent_only_path.contains(
+                &torrent
+                    .id
+                    .to_string()
+            ),
+            "torrent-only playback should retain the Auto winner; got {torrent_only_path}"
         );
     }
 

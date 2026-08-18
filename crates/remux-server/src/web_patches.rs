@@ -12,14 +12,19 @@ pub static CSS: &str = r##"
 
   /* ── Play button: disabled by default, enabled when streams arrive ── */
   .detailPagePrimaryContainer .btnPlay {
-    opacity: 0.4;
-    pointer-events: none;
-    cursor: default;
+    opacity: 0.4 !important;
+    pointer-events: none !important;
+    cursor: default !important;
   }
   .detailPagePrimaryContainer.remux-streams-ready .btnPlay {
-    opacity: 1;
-    pointer-events: auto;
-    cursor: pointer;
+    opacity: 1 !important;
+    pointer-events: auto !important;
+    cursor: pointer !important;
+  }
+
+  /* Keep the existing Back control pointer-accessible until video actually starts. */
+  html.remux-playback-starting .skinHeader {
+    z-index: 1001;
   }
 
   /* Keep the header's actual controls available to the pointer even when an
@@ -244,7 +249,7 @@ pub static JS: &str = r#"
     var obs = new MutationObserver(function () {
       if (form._remuxRendering) return;
       if (!form._remuxLoaded) return;
-      var ms = window._remuxCurrentMediaSources;
+      var ms = form._remuxMediaSources;
       if (!ms || !ms.length) return;
       renderAsyncTrackSelections(page, ms);
     });
@@ -271,7 +276,6 @@ pub static JS: &str = r#"
 
     renderTracksForSource(page, mediaSources, selectedId);
 
-    window._remuxCurrentMediaSources = mediaSources;
     form._remuxMediaSources = mediaSources;
     form._remuxLoaded = true;
 
@@ -291,25 +295,27 @@ pub static JS: &str = r#"
     setTimeout(function () { form._remuxRendering = false; }, 0);
   }
 
-  // Adds a second change listener that re-renders stream dropdowns when the user picks
-  // a different version. The original listener throws because self._currentPlaybackMediaSources
-  // is null (renderTrackSelections was called without MediaSources), but our listener runs
-  // after the throw and renders correctly from window._remuxCurrentMediaSources.
+  // Handle source changes before Jellyfin's listener. The initial lightweight
+  // item intentionally has no MediaSources, so Jellyfin's cached source array
+  // is empty and its listener cannot render these controls.
   function attachSourceChangeHandler(page) {
     var sel = page.querySelector('.selectSource');
     if (sel._remuxHandlerAttached) return;
     sel._remuxHandlerAttached = true;
-    sel.addEventListener('change', function () {
-      var ms = window._remuxCurrentMediaSources;
+    sel.addEventListener('change', function (event) {
+      var form = page.querySelector('.trackSelections');
+      var ms = form && form._remuxMediaSources;
       if (!ms) return;
+      event.stopImmediatePropagation();
       renderTracksForSource(page, ms, sel.value);
-    });
+    }, true);
   }
 
   function patchApiClientProto(apiClient) {
     var proto = Object.getPrototypeOf(apiClient);
     if (!proto || proto._remuxGetItemPatched) return;
     proto._remuxGetItemPatched = true;
+    var _getItem = proto.getItem;
 
     // Only getItem owns the follow-up MediaSources request below. Generic item
     // fetches must remain intact: reducing one to ChildCount would leave callers
@@ -318,14 +324,11 @@ pub static JS: &str = r#"
       var self = this;
       // Guard: itemId may be non-string (e.g. undefined) when called from list-view play buttons.
       if (typeof itemId !== 'string') {
-        return self.getJSON(self.getUrl('Users/' + userId + '/Items/' + itemId));
+        return _getItem.apply(self, arguments);
       }
       var capturedId = itemId;
       // Strip dashes so we can match against both UUID formats in the URL.
       var capturedIdNoDash = itemId.replace(/-/g, '');
-      var baseUrl = self.getUrl('Users/' + userId + '/Items/' + itemId);
-      var sep = baseUrl.indexOf('?') >= 0 ? '&' : '?';
-      var fastUrl = baseUrl + sep + 'Fields=ChildCount';
 
       // True when the current URL belongs to this item's detail page.
       // Related-item fetches (next-up cards, season metadata, previews) have IDs
@@ -334,6 +337,15 @@ pub static JS: &str = r#"
         var h = location.href;
         return h.indexOf(capturedId) !== -1 || h.indexOf(capturedIdNoDash) !== -1;
       }
+
+      // Playback, remote-control, editor, and local-file code also call getItem.
+      // Preserve the native request for anything except the item whose details
+      // page is currently visible.
+      if (!isCurrentPage()) return _getItem.apply(self, arguments);
+
+      var baseUrl = self.getUrl('Users/' + userId + '/Items/' + itemId);
+      var sep = baseUrl.indexOf('?') >= 0 ? '&' : '?';
+      var fastUrl = baseUrl + sep + 'Fields=ChildCount';
 
       return self.getJSON(fastUrl).then(function (item) {
         var type = item && item.Type;
@@ -346,16 +358,17 @@ pub static JS: &str = r#"
         // Jellyfin caches old views in the DOM (hidden), so querySelector('.detailPagePrimaryContainer')
         // may return a hidden old view's container. We use offsetParent to find the visible one.
         function watchAndEnable() {
-          var seen = new WeakSet();
+          var deadline = Date.now() + 5000;
           function tryEnable() {
-            if (!isCurrentPage()) { wObs.disconnect(); return; }
+            if (!isCurrentPage()) return;
             var c = getVisiblePrimaryContainer();
-            if (c && !seen.has(c)) { seen.add(c); c.classList.add('remux-streams-ready'); }
+            if (c) {
+              c.classList.add('remux-streams-ready');
+              return;
+            }
+            if (Date.now() < deadline) setTimeout(tryEnable, 50);
           }
-          var wObs = new MutationObserver(function () { tryEnable(); });
-          wObs.observe(document.body, { childList: true, subtree: true });
           tryEnable();
-          setTimeout(function () { wObs.disconnect(); }, 5000);
         }
 
         if (!isMovieOrEpisode) {
@@ -382,6 +395,11 @@ pub static JS: &str = r#"
             var streamsReady = ms && ms.length && full.LocationType !== 'Virtual';
 
             if (streamsReady) {
+              // Jellyfin retains the object returned by the initial request as
+              // currentItem. Keep it complete for playback and other native
+              // consumers instead of updating only our rendered controls.
+              item.MediaSources = ms;
+              if (full.MediaStreams) item.MediaStreams = full.MediaStreams;
               // Enable the play button as soon as streams are confirmed.
               watchAndEnable();
             }
@@ -627,6 +645,103 @@ pub static JS: &str = r#"
   document.addEventListener('keydown', selectPointedHeaderControl, true);
 }());
 
+// Jellyfin raises the video layer above the header before playback has started.
+// Keep Back clickable during that interval and route it through Jellyfin's own
+// stop command so an in-flight player is fully cleaned up before navigation.
+(function () {
+  var STARTING_CLASS = 'remux-playback-starting';
+  var playStartedAt = 0;
+  var playGeneration = 0;
+
+  function clearStarting() {
+    document.documentElement.classList.remove(STARTING_CLASS);
+  }
+
+  function currentPlaySessionId(startedAt) {
+    if (!window.performance || !performance.getEntriesByType) return null;
+    var entries = performance.getEntriesByType('resource');
+    for (var i = entries.length - 1; i >= 0; i--) {
+      if (entries[i].startTime < startedAt - 1000) break;
+      try {
+        var id = new URL(entries[i].name, location.href).searchParams.get('PlaySessionId');
+        if (id) return id;
+      } catch (error) {}
+    }
+    return null;
+  }
+
+  function stopEncodingWhenAvailable(apiClient, startedAt, generation, deadline) {
+    if (generation !== playGeneration) return;
+    var playSessionId = currentPlaySessionId(startedAt);
+    if (playSessionId) {
+      apiClient.stopActiveEncodings(playSessionId).catch(function () {});
+      return;
+    }
+    if (performance.now() < deadline) {
+      setTimeout(function () {
+        stopEncodingWhenAvailable(apiClient, startedAt, generation, deadline);
+      }, 100);
+    }
+  }
+
+  function clearWhenPlaybackChanges(event) {
+    var target = event.target;
+    if (target && target.matches && target.matches('.videoPlayerContainer-onTop video')) {
+      clearStarting();
+    }
+  }
+
+  document.addEventListener('playing', clearWhenPlaybackChanges, true);
+  document.addEventListener('emptied', clearWhenPlaybackChanges, true);
+
+  document.addEventListener('click', function (event) {
+    var target = event.target;
+    if (!target || !target.closest) return;
+
+    if (target.closest('.btnPlay, .btnReplay')) {
+      document.documentElement.classList.add(STARTING_CLASS);
+      playStartedAt = performance.now();
+      playGeneration += 1;
+      return;
+    }
+
+    if (!document.documentElement.classList.contains(STARTING_CLASS)
+        || !target.closest('.headerBackButton')) return;
+
+    event.preventDefault();
+    event.stopImmediatePropagation();
+    var button = target.closest('.headerBackButton');
+    var playerContainer = document.querySelector('.videoPlayerContainer-onTop');
+    if (playerContainer) playerContainer.classList.remove('videoPlayerContainer-onTop');
+    var video = playerContainer && playerContainer.querySelector('video');
+    if (video) video.pause();
+    var apiClient = window.ApiClient;
+    if (apiClient && typeof apiClient.stopActiveEncodings === 'function') {
+      stopEncodingWhenAvailable(
+        apiClient,
+        playStartedAt,
+        playGeneration,
+        performance.now() + 30000
+      );
+    }
+    if (apiClient && typeof apiClient.sendPlayStateCommand === 'function') {
+      apiClient.sendPlayStateCommand(apiClient.deviceId(), 'Stop').catch(function () {});
+    }
+    clearStarting();
+    setTimeout(function () { button.click(); }, 0);
+  }, true);
+}());
+
+// Search results already update on every input event. Enter therefore only
+// needs to finish text entry; blur dismisses browser and webOS keyboards.
+(function () {
+  document.addEventListener('keydown', function (event) {
+    var target = event.target;
+    if (event.key !== 'Enter' || !target || target.id !== 'searchTextInput') return;
+    setTimeout(function () { target.blur(); }, 0);
+  }, true);
+}());
+
 // Strip "Recently Added in " prefix from homescreen section titles, leaving only the library name.
 (function () {
   var PREFIX = 'Recently Added in ';
@@ -672,6 +787,18 @@ mod tests {
     fn generic_item_transports_are_not_rewritten_to_source_stubs() {
         assert!(!JS.contains("proto.fetch = function"));
         assert!(!JS.contains("XMLHttpRequest.prototype.open = function"));
+        assert!(
+            JS.contains(
+                "if (!isCurrentPage()) return _getItem.apply(self, arguments);"
+            )
+        );
+    }
+
+    #[test]
+    fn async_sources_remain_scoped_to_their_detail_page() {
+        assert!(JS.contains("item.MediaSources = ms;"));
+        assert!(JS.contains("var ms = form._remuxMediaSources;"));
+        assert!(!JS.contains("window._remuxCurrentMediaSources"));
     }
 
     #[test]

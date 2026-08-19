@@ -36,6 +36,56 @@ pub static CSS: &str = r##"
   html.layout-tv .skinHeader [role="button"] {
     pointer-events: auto !important;
   }
+
+  .remux-startup-status {
+    position: absolute;
+    left: 50%;
+    bottom: 12%;
+    z-index: 2;
+    box-sizing: border-box;
+    width: calc(100% - 4em);
+    max-width: 36em;
+    padding: 1em 1.25em;
+    transform: translateX(-50%);
+    border-radius: 0.45em;
+    background: rgba(0, 0, 0, 0.74);
+    color: #fff;
+    text-align: center;
+    pointer-events: none;
+  }
+  .remux-startup-title {
+    font-size: 1.2em;
+    font-weight: 500;
+  }
+  .remux-startup-detail,
+  .remux-startup-footnote {
+    margin-top: 0.45em;
+    color: rgba(255, 255, 255, 0.78);
+    font-size: 0.86em;
+    line-height: 1.35;
+  }
+  .remux-startup-progress {
+    height: 0.3em;
+    margin-top: 0.8em;
+    overflow: hidden;
+    border-radius: 0.2em;
+    background: rgba(255, 255, 255, 0.2);
+  }
+  .remux-startup-progress-bar {
+    width: 0;
+    height: 100%;
+    border-radius: inherit;
+    background: #00a4dc;
+    transition: width 0.4s linear;
+  }
+  .remux-startup-progress-bar.remux-indeterminate {
+    width: 35%;
+    animation: remux-progress-slide 1.3s ease-in-out infinite;
+  }
+  @keyframes remux-progress-slide {
+    from { transform: translateX(-110%); }
+    to { transform: translateX(310%); }
+  }
 "##;
 
 /// JS injected before `</body>` of every HTML response.
@@ -646,18 +696,161 @@ pub static JS: &str = r#"
 }());
 
 // Jellyfin raises the video layer above the header before playback has started.
-// Keep Back clickable during that interval and route it through Jellyfin's own
-// stop command so an in-flight player is fully cleaned up before navigation.
+// Keep Back clickable, show server-reported startup progress, and route a
+// cancellation through Jellyfin's own stop command before navigation.
 (function () {
   var STARTING_CLASS = 'remux-playback-starting';
   var playStartedAt = 0;
   var playGeneration = 0;
+  var statusTimer = null;
+  var selectedSourceLabel = '';
+
+  var PHASE_LABELS = {
+    preparing_playback: 'Preparing playback',
+    starting_player: 'Starting the player',
+    selecting_source: 'Finding a fast source',
+    prebuffering: 'Building a playback buffer',
+    opening_stream: 'Opening the selected stream',
+    preparing_video: 'Preparing video',
+    starting_playback: 'Starting playback'
+  };
+
+  function removeStartupStatus() {
+    if (statusTimer !== null) {
+      clearTimeout(statusTimer);
+      statusTimer = null;
+    }
+    var status = document.querySelector('.remux-startup-status');
+    if (status && status.parentNode) status.parentNode.removeChild(status);
+  }
 
   function clearStarting() {
     document.documentElement.classList.remove(STARTING_CLASS);
+    removeStartupStatus();
+  }
+
+  function selectedSource() {
+    var selects = document.querySelectorAll('.selectSource');
+    for (var i = 0; i < selects.length; i++) {
+      if (selects[i].offsetParent !== null && selects[i].selectedIndex >= 0) {
+        return selects[i].options[selects[i].selectedIndex].text;
+      }
+    }
+    return '';
+  }
+
+  function ensureStartupStatus() {
+    var container = document.querySelector('.videoPlayerContainer-onTop');
+    if (!container) return null;
+    var status = container.querySelector('.remux-startup-status');
+    if (status) return status;
+
+    status = document.createElement('div');
+    status.className = 'remux-startup-status';
+    status.innerHTML =
+      '<div class="remux-startup-title" aria-live="polite"></div>' +
+      '<div class="remux-startup-detail"></div>' +
+      '<div class="remux-startup-progress" role="progressbar">' +
+        '<div class="remux-startup-progress-bar remux-indeterminate"></div>' +
+      '</div>' +
+      '<div class="remux-startup-footnote"></div>';
+    container.appendChild(status);
+    return status;
+  }
+
+  function formatBytes(bytes) {
+    var value = Number(bytes) || 0;
+    if (value >= 1073741824) return (value / 1073741824).toFixed(1) + ' GB';
+    if (value >= 1048576) return Math.round(value / 1048576) + ' MB';
+    if (value >= 1024) return Math.round(value / 1024) + ' KB';
+    return Math.round(value) + ' bytes';
+  }
+
+  function formatRate(bitsPerSecond) {
+    var value = Number(bitsPerSecond) || 0;
+    if (value >= 1000000) return (value / 1000000).toFixed(1) + ' Mbps';
+    if (value >= 1000) return Math.round(value / 1000) + ' Kbps';
+    return '';
+  }
+
+  function formatWait(seconds) {
+    var value = Math.max(0, Math.ceil(Number(seconds) || 0));
+    if (value < 60) return value + 's';
+    if (value < 3600) {
+      return Math.floor(value / 60) + 'm ' + (value % 60) + 's';
+    }
+    return Math.floor(value / 3600) + 'h ' + Math.floor(value % 3600 / 60) + 'm';
+  }
+
+  function renderStartupStatus(startup) {
+    var status = ensureStartupStatus();
+    if (!status) return;
+
+    var phase = startup && startup.Phase || 'preparing_playback';
+    var elapsed = startup && startup.ElapsedMilliseconds;
+    if (elapsed == null) elapsed = Math.max(0, performance.now() - playStartedAt);
+    var detail = selectedSourceLabel;
+    var prebuffer = startup && startup.Prebuffer;
+    var progress = null;
+    var estimatedWait = null;
+
+    if (prebuffer) {
+      var downloaded = Number(prebuffer.DownloadedBytes) || 0;
+      var target = Number(prebuffer.TargetBytes) || 0;
+      if (prebuffer.RateTrusted && target > 0) {
+        detail = formatBytes(downloaded) + ' of ' + formatBytes(target) + ' buffered';
+        var rate = formatRate(prebuffer.EstimatedGoodputBitsPerSecond);
+        if (rate) detail += ' · ' + rate;
+        if (prebuffer.EstimatedWaitSeconds != null) {
+          estimatedWait = Number(prebuffer.EstimatedWaitSeconds);
+        }
+        progress = Math.max(0, Math.min(100, downloaded / target * 100));
+      } else {
+        detail = formatBytes(downloaded) + ' buffered · measuring download speed';
+      }
+    } else if (phase === 'selecting_source') {
+      detail = selectedSourceLabel
+        ? selectedSourceLabel + ' · testing available sources'
+        : 'Testing available sources';
+    }
+
+    status.querySelector('.remux-startup-title').textContent =
+      PHASE_LABELS[phase] || PHASE_LABELS.preparing_playback;
+    status.querySelector('.remux-startup-detail').textContent = detail || 'Preparing the selected version';
+    var footnote = 'Elapsed ' + formatWait(elapsed / 1000);
+    if (estimatedWait !== null) {
+      footnote += ' · Estimated start in ' + formatWait(estimatedWait);
+    } else if (prebuffer) {
+      footnote += ' · Estimating start time';
+    }
+    status.querySelector('.remux-startup-footnote').textContent = footnote;
+
+    var track = status.querySelector('.remux-startup-progress');
+    var bar = status.querySelector('.remux-startup-progress-bar');
+    if (progress === null) {
+      bar.className = 'remux-startup-progress-bar remux-indeterminate';
+      bar.style.width = '';
+      track.removeAttribute('aria-valuenow');
+    } else {
+      bar.className = 'remux-startup-progress-bar';
+      bar.style.width = progress.toFixed(1) + '%';
+      track.setAttribute('aria-valuemin', '0');
+      track.setAttribute('aria-valuemax', '100');
+      track.setAttribute('aria-valuenow', String(Math.round(progress)));
+    }
   }
 
   function currentPlaySessionId(startedAt) {
+    var video = document.querySelector('.videoPlayerContainer-onTop video');
+    if (video) {
+      try {
+        var videoId = new URL(
+          video.currentSrc || video.getAttribute('src'),
+          location.href
+        ).searchParams.get('PlaySessionId');
+        if (videoId) return videoId;
+      } catch (error) {}
+    }
     if (!window.performance || !performance.getEntriesByType) return null;
     var entries = performance.getEntriesByType('resource');
     for (var i = entries.length - 1; i >= 0; i--) {
@@ -684,6 +877,43 @@ pub static JS: &str = r#"
     }
   }
 
+  function scheduleStartupStatus(generation, delay) {
+    statusTimer = setTimeout(function () {
+      pollStartupStatus(generation);
+    }, delay);
+  }
+
+  function pollStartupStatus(generation) {
+    if (generation !== playGeneration
+        || !document.documentElement.classList.contains(STARTING_CLASS)) return;
+
+    renderStartupStatus(null);
+    var apiClient = window.ApiClient;
+    if (!apiClient || !window.fetch) {
+      scheduleStartupStatus(generation, 250);
+      return;
+    }
+
+    var url = apiClient.getUrl('Remux/Playback/Startup', { _: Date.now() });
+    fetch(url, {
+      cache: 'no-store',
+      headers: { 'X-Emby-Token': apiClient.accessToken() }
+    }).then(function (response) {
+      if (!response.ok) throw new Error('startup status unavailable');
+      return response.json();
+    }).then(function (startup) {
+      if (generation !== playGeneration
+          || !document.documentElement.classList.contains(STARTING_CLASS)) return;
+      renderStartupStatus(startup);
+      scheduleStartupStatus(generation, 500);
+    }, function () {
+      if (generation === playGeneration
+          && document.documentElement.classList.contains(STARTING_CLASS)) {
+        scheduleStartupStatus(generation, 500);
+      }
+    });
+  }
+
   function clearWhenPlaybackChanges(event) {
     var target = event.target;
     if (target && target.matches && target.matches('.videoPlayerContainer-onTop video')) {
@@ -699,9 +929,12 @@ pub static JS: &str = r#"
     if (!target || !target.closest) return;
 
     if (target.closest('.btnPlay, .btnReplay')) {
+      removeStartupStatus();
       document.documentElement.classList.add(STARTING_CLASS);
       playStartedAt = performance.now();
       playGeneration += 1;
+      selectedSourceLabel = selectedSource();
+      scheduleStartupStatus(playGeneration, 0);
       return;
     }
 
@@ -815,5 +1048,11 @@ mod tests {
         );
         assert!(JS.contains("control.click();"));
         assert!(JS.contains("routeHeaderClick"));
+    }
+
+    #[test]
+    fn startup_status_shows_eta_without_a_cancellation_hint() {
+        assert!(JS.contains("Estimated start in"));
+        assert!(!JS.contains("Back cancels"));
     }
 }

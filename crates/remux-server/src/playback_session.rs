@@ -78,6 +78,18 @@ pub struct PlaybackStartupReport {
     pub failure_reason: Option<String>,
 }
 
+#[derive(Clone, Debug)]
+pub struct PlaybackStartupProgress {
+    pub play_session_id: String,
+    pub user_id: Uuid,
+    pub elapsed: Duration,
+    pub playback_info_ready: bool,
+    pub hls_requested: bool,
+    pub source_selected: bool,
+    pub transcode_started: bool,
+    pub first_segment_served: bool,
+}
+
 #[derive(Clone)]
 pub struct PlaybackSessionManager {
     sessions: Arc<DashMap<String, PlaybackSession>>,
@@ -195,6 +207,43 @@ impl PlaybackSessionManager {
     pub fn has_startup(&self, play_session_id: &str) -> bool {
         self.startups
             .contains_key(play_session_id)
+    }
+
+    /// Return the newest unfinished startup for a device. A client can begin a
+    /// replacement attempt before the prior one has fully unwound.
+    pub fn startup_progress_for_device(
+        &self,
+        device_id: &str,
+    ) -> Option<PlaybackStartupProgress> {
+        let startup = self
+            .startups
+            .iter()
+            .filter(|entry| entry.device_id == device_id)
+            .max_by_key(|entry| entry.started)?;
+        Some(PlaybackStartupProgress {
+            play_session_id: startup
+                .key()
+                .clone(),
+            user_id: startup.user_id,
+            elapsed: startup
+                .started
+                .elapsed(),
+            playback_info_ready: startup
+                .playback_info_ready
+                .is_some(),
+            hls_requested: startup
+                .hls_requested
+                .is_some(),
+            source_selected: startup
+                .source_selected
+                .is_some(),
+            transcode_started: startup
+                .transcode_started
+                .is_some(),
+            first_segment_served: startup
+                .first_segment_served
+                .is_some(),
+        })
     }
 
     fn mark_startup<F>(&self, play_session_id: &str, update: F)
@@ -1328,6 +1377,60 @@ async fn kill_transcode(ts: Arc<tokio::sync::RwLock<TranscodeSession>>) {
 #[cfg(test)]
 mod startup_metric_tests {
     use super::*;
+
+    #[test]
+    fn startup_progress_exposes_in_flight_milestones() {
+        let temp = tempfile::tempdir().unwrap();
+        let manager = PlaybackSessionManager::new(temp.path());
+        let play_session_id = "progress-test";
+        let user_id = Uuid::new_v4();
+        let source_id = Uuid::new_v4();
+
+        manager.begin_startup(
+            play_session_id,
+            Uuid::new_v4(),
+            user_id,
+            "device",
+            "client",
+        );
+        manager.mark_playback_info_ready(play_session_id);
+        manager.mark_hls_requested(play_session_id);
+        manager.mark_source_selected(play_session_id, source_id);
+
+        let progress = manager
+            .startup_progress_for_device("device")
+            .unwrap();
+        assert_eq!(progress.play_session_id, play_session_id);
+        assert_eq!(progress.user_id, user_id);
+        assert!(progress.playback_info_ready);
+        assert!(progress.hls_requested);
+        assert!(progress.source_selected);
+        assert!(!progress.transcode_started);
+        assert!(!progress.first_segment_served);
+    }
+
+    #[test]
+    fn startup_progress_uses_the_newest_attempt_for_a_device() {
+        let temp = tempfile::tempdir().unwrap();
+        let manager = PlaybackSessionManager::new(temp.path());
+        let user_id = Uuid::new_v4();
+
+        manager.begin_startup("older", Uuid::new_v4(), user_id, "device", "client");
+        manager.begin_startup("newer", Uuid::new_v4(), user_id, "device", "client");
+        manager
+            .startups
+            .get_mut("older")
+            .unwrap()
+            .started = Instant::now() - Duration::from_secs(1);
+
+        assert_eq!(
+            manager
+                .startup_progress_for_device("device")
+                .unwrap()
+                .play_session_id,
+            "newer"
+        );
+    }
 
     #[tokio::test]
     async fn startup_can_own_a_stream_until_it_reaches_a_terminal_outcome() {

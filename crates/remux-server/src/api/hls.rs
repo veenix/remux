@@ -8,6 +8,7 @@ use std::{
 };
 
 use axum::{
+    Json,
     body::Body,
     extract::{Path, State},
     response::IntoResponse,
@@ -15,8 +16,9 @@ use axum::{
 use axum_anyhow::ApiResult as Result;
 use axum_extra::extract::Query;
 use futures_util::StreamExt;
-use http::{Response, StatusCode};
+use http::{Response, StatusCode, header};
 use remux_macros::get;
+use serde::Serialize;
 use tokio_util::io::ReaderStream;
 use tracing::{debug, error, info, trace, warn};
 use uuid::Uuid;
@@ -120,6 +122,24 @@ struct AutoPrebufferPlan {
     rate_trusted: AtomicBool,
 }
 
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "PascalCase")]
+struct PlaybackStartupStatusResponse {
+    phase: &'static str,
+    elapsed_milliseconds: u64,
+    prebuffer: Option<PrebufferStatusResponse>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "PascalCase")]
+struct PrebufferStatusResponse {
+    downloaded_bytes: u64,
+    target_bytes: u64,
+    estimated_goodput_bits_per_second: u64,
+    estimated_wait_seconds: Option<u64>,
+    rate_trusted: bool,
+}
+
 impl AutoPrebufferPlan {
     fn from_probe(result: &StartupProbeResult) -> Option<Self> {
         let source_size_bytes = result.source_size_bytes?;
@@ -193,6 +213,72 @@ impl AutoPrebufferPlan {
         deficit_buffer
             .max(minimum_runway)
             .min(remaining_bytes)
+    }
+}
+
+impl PrebufferStatusResponse {
+    fn from_plan(plan: &AutoPrebufferPlan) -> Self {
+        let downloaded_bytes = plan.downloaded_bytes();
+        let target_bytes = plan.target_bytes();
+        let estimated_goodput = plan.estimated_goodput_bps();
+        let rate_trusted = plan
+            .rate_trusted
+            .load(Ordering::Relaxed);
+        let remaining_bytes = target_bytes.saturating_sub(downloaded_bytes);
+        let estimated_wait_seconds = (rate_trusted
+            && estimated_goodput.is_finite()
+            && estimated_goodput > 0.0
+            && remaining_bytes > 0)
+            .then(|| {
+                (remaining_bytes as f64 * 8.0 / estimated_goodput)
+                    .ceil()
+                    .min(u64::MAX as f64) as u64
+            });
+
+        Self {
+            downloaded_bytes,
+            target_bytes,
+            estimated_goodput_bits_per_second: finite_u64(estimated_goodput),
+            estimated_wait_seconds,
+            rate_trusted,
+        }
+    }
+}
+
+fn finite_u64(value: f64) -> u64 {
+    if value.is_finite() && value > 0.0 {
+        value
+            .round()
+            .min(u64::MAX as f64) as u64
+    } else {
+        0
+    }
+}
+
+fn duration_milliseconds(value: Duration) -> u64 {
+    value
+        .as_millis()
+        .min(u64::MAX as u128) as u64
+}
+
+fn startup_phase(
+    progress: &crate::playback_session::PlaybackStartupProgress,
+    has_prebuffer: bool,
+) -> &'static str {
+    if progress.first_segment_served {
+        "starting_playback"
+    } else if progress.transcode_started {
+        "preparing_video"
+    } else if has_prebuffer {
+        "prebuffering"
+    } else if progress.source_selected {
+        "opening_stream"
+    } else if progress.hls_requested {
+        "selecting_source"
+    } else if progress.playback_info_ready {
+        "starting_player"
+    } else {
+        "preparing_playback"
     }
 }
 
@@ -341,6 +427,40 @@ fn clear_auto_prebuffer_plan(state: &AppState, play_session_id: &str) {
         .ctx
         .store
         .delete(auto_prebuffer_plan_key(play_session_id));
+}
+
+#[get("/remux/playback/startup")]
+pub async fn playback_startup_status(
+    State(state): State<AppState>,
+    session: auth::AuthSession,
+) -> Result<impl IntoResponse> {
+    let progress = state
+        .ctx
+        .sessions
+        .startup_progress_for_device(
+            &session
+                .device
+                .id,
+        )
+        .context_not_found("playback startup not found")?;
+    if progress.user_id
+        != session
+            .user
+            .id
+    {
+        return Err(anyhow::anyhow!("playback startup not found")
+            .context_not_found("playback startup not found"));
+    }
+
+    let prebuffer = auto_prebuffer_plan(&state, &progress.play_session_id)
+        .map(|plan| PrebufferStatusResponse::from_plan(&plan));
+    let response = PlaybackStartupStatusResponse {
+        phase: startup_phase(&progress, prebuffer.is_some()),
+        elapsed_milliseconds: duration_milliseconds(progress.elapsed),
+        prebuffer,
+    };
+
+    Ok(([(header::CACHE_CONTROL, "no-store")], Json(response)))
 }
 
 fn retain_prebuffer_candidate(
@@ -4036,6 +4156,63 @@ mod tests {
             required_bitrate_bps: required_mbps.map(|value| value * 1_000_000.0),
             error: None,
         }
+    }
+
+    #[test]
+    fn startup_status_phase_follows_server_milestones() {
+        let mut progress = crate::playback_session::PlaybackStartupProgress {
+            play_session_id: "test".to_string(),
+            user_id: uuid::Uuid::nil(),
+            elapsed: Duration::ZERO,
+            playback_info_ready: false,
+            hls_requested: false,
+            source_selected: false,
+            transcode_started: false,
+            first_segment_served: false,
+        };
+
+        assert_eq!(super::startup_phase(&progress, false), "preparing_playback");
+        progress.playback_info_ready = true;
+        assert_eq!(super::startup_phase(&progress, false), "starting_player");
+        progress.hls_requested = true;
+        assert_eq!(super::startup_phase(&progress, false), "selecting_source");
+        progress.source_selected = true;
+        assert_eq!(super::startup_phase(&progress, false), "opening_stream");
+        assert_eq!(super::startup_phase(&progress, true), "prebuffering");
+        progress.transcode_started = true;
+        assert_eq!(super::startup_phase(&progress, true), "preparing_video");
+        progress.first_segment_served = true;
+        assert_eq!(super::startup_phase(&progress, true), "starting_playback");
+    }
+
+    #[test]
+    fn prebuffer_status_waits_for_a_trusted_rate_before_reporting_eta() {
+        use std::sync::atomic::{AtomicBool, AtomicU64};
+
+        let plan = super::AutoPrebufferPlan {
+            source_id: uuid::Uuid::nil(),
+            range_start: 0,
+            source_size_bytes: 1_000_000,
+            required_bitrate_bps: 8_000_000.0,
+            remaining_duration_seconds: 1.0,
+            next_offset: AtomicU64::new(100_000),
+            estimated_goodput_bps: AtomicU64::new(4_000_000.0f64.to_bits()),
+            rate_trusted: AtomicBool::new(false),
+        };
+
+        let measuring = super::PrebufferStatusResponse::from_plan(&plan);
+        assert_eq!(measuring.downloaded_bytes, 100_000);
+        assert!(
+            measuring
+                .estimated_wait_seconds
+                .is_none()
+        );
+
+        plan.rate_trusted
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let trusted = super::PrebufferStatusResponse::from_plan(&plan);
+        assert_eq!(trusted.target_bytes, 1_000_000);
+        assert_eq!(trusted.estimated_wait_seconds, Some(2));
     }
 
     #[test]

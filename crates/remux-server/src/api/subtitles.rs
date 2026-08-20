@@ -12,11 +12,63 @@ use uuid::Uuid;
 
 use crate::{
     AppState, IntoApiError, OptionExt, ResultExt, api, common::HideConsole, db,
-    db::auth,
+    db::auth, playback_session::PlaybackSessionManager,
 };
 
 fn ffmpeg_bin() -> String {
     std::env::var("FFMPEG_PATH").unwrap_or_else(|_| "ffmpeg".into())
+}
+
+async fn wait_for_playback_end(
+    sessions: PlaybackSessionManager,
+    play_session_id: String,
+) {
+    let mut interval = tokio::time::interval(std::time::Duration::from_millis(100));
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        interval
+            .tick()
+            .await;
+        if sessions
+            .get(&play_session_id)
+            .is_none()
+            && !sessions.has_startup(&play_session_id)
+        {
+            return;
+        }
+    }
+}
+
+/// Run subtitle extraction while its playback session remains alive. Jellyfin
+/// can leave the subtitle fetch open after navigating away, so relying on the
+/// HTTP response being dropped can keep ffmpeg and a torrent stream alive for
+/// the full timeout.
+async fn run_subtitle_command(
+    cmd: &mut tokio::process::Command,
+    playback: Option<(PlaybackSessionManager, String)>,
+) -> anyhow::Result<Option<std::process::Output>> {
+    cmd.kill_on_drop(true);
+    let output =
+        tokio::time::timeout(std::time::Duration::from_secs(120), cmd.output());
+    tokio::pin!(output);
+
+    let result = match playback {
+        Some((sessions, play_session_id)) => {
+            tokio::select! {
+                result = &mut output => Some(result),
+                () = wait_for_playback_end(sessions, play_session_id) => None,
+            }
+        }
+        None => Some(output.await),
+    };
+    let Some(result) = result else {
+        return Ok(None);
+    };
+    Ok(Some(
+        result
+            .map_err(|_| anyhow!("subtitle extraction timed out"))?
+            .map_err(|e| anyhow!("failed to run ffmpeg: {e}"))?,
+    ))
 }
 
 /// The cache storage codec for a requested text subtitle format: ASS/SSA requests
@@ -78,7 +130,8 @@ async fn extract_subtitle_to_cache(
     stream_index: i64,
     cache_codec: api::SubtitleCodec,
     source_codec: Option<&str>,
-) -> anyhow::Result<std::path::PathBuf> {
+    playback: Option<(PlaybackSessionManager, String)>,
+) -> anyhow::Result<Option<std::path::PathBuf>> {
     let cache_dir = data_dir.join("subtitle-cache");
     tokio::fs::create_dir_all(&cache_dir)
         .await
@@ -95,7 +148,7 @@ async fn extract_subtitle_to_cache(
             .trim()
             .is_empty()
         {
-            return Ok(cache_path);
+            return Ok(Some(cache_path));
         }
     }
 
@@ -103,7 +156,6 @@ async fn extract_subtitle_to_cache(
     let ffmpeg_format = cache_codec.to_string();
     let mut cmd = tokio::process::Command::new(ffmpeg_bin());
     cmd.hide_console();
-    cmd.kill_on_drop(true);
     cmd.args([
         "-y",
         "-nostdin",
@@ -126,17 +178,17 @@ async fn extract_subtitle_to_cache(
     cmd.stdout(std::process::Stdio::null());
     cmd.stderr(std::process::Stdio::piped());
 
-    let output =
-        tokio::time::timeout(std::time::Duration::from_secs(120), cmd.output())
-            .await
-            .map_err(|_| {
-                let p = cache_path.clone();
-                tokio::spawn(async move {
-                    let _ = tokio::fs::remove_file(p).await;
-                });
-                anyhow!("subtitle extraction timed out")
-            })?
-            .map_err(|e| anyhow!("failed to run ffmpeg: {e}"))?;
+    let output = match run_subtitle_command(&mut cmd, playback).await {
+        Ok(Some(output)) => output,
+        Ok(None) => {
+            let _ = tokio::fs::remove_file(&cache_path).await;
+            return Ok(None);
+        }
+        Err(error) => {
+            let _ = tokio::fs::remove_file(&cache_path).await;
+            return Err(error);
+        }
+    };
 
     if !output
         .status
@@ -157,7 +209,7 @@ async fn extract_subtitle_to_cache(
         anyhow::bail!("subtitle extraction produced empty output");
     }
 
-    Ok(cache_path)
+    Ok(Some(cache_path))
 }
 
 /// Subtitle extraction endpoint - extracts a subtitle stream from a media source
@@ -261,6 +313,17 @@ fn torrent_subtitle_routes_key(
     media_source_id: Uuid,
 ) -> String {
     format!("torrent-subtitle-routes:{device_id}:{item_id}:{media_source_id}")
+}
+
+fn next_external_subtitle_index(
+    source_indices: impl IntoIterator<Item = i64>,
+    torrent_sidecar_indices: impl IntoIterator<Item = i64>,
+) -> i64 {
+    source_indices
+        .into_iter()
+        .chain(torrent_sidecar_indices)
+        .max()
+        .map_or(0, |index| index + 1)
 }
 
 /// Build subtitle descriptors from cached torrent metadata. The metadata scan
@@ -493,6 +556,24 @@ async fn subtitles_stream_inner(
     stream_index: i64,
     format: String,
 ) -> Result<impl IntoResponse> {
+    let playback = state
+        .ctx
+        .sessions
+        .get_by_device(
+            &session
+                .device
+                .id,
+        )
+        .filter(|playback| playback.item_id == item_id)
+        .map(|playback| {
+            (
+                state
+                    .ctx
+                    .sessions
+                    .clone(),
+                playback.play_session_id,
+            )
+        });
     let torrent_routes = load_torrent_subtitle_routes(
         &state.ctx,
         &session
@@ -710,7 +791,6 @@ async fn subtitles_stream_inner(
     if is_binary {
         let mut cmd = tokio::process::Command::new(ffmpeg_bin());
         cmd.hide_console();
-        cmd.kill_on_drop(true);
         cmd.args([
             "-copyts",
             "-i",
@@ -727,11 +807,10 @@ async fn subtitles_stream_inner(
         ]);
         cmd.stdout(std::process::Stdio::piped());
         cmd.stderr(std::process::Stdio::piped());
-        let output =
-            tokio::time::timeout(std::time::Duration::from_secs(120), cmd.output())
-                .await
-                .map_err(|_| anyhow!("subtitle extraction timed out"))?
-                .map_err(|e| anyhow!("failed to run ffmpeg: {e}"))?;
+        let Some(output) = run_subtitle_command(&mut cmd, playback).await? else {
+            debug!(%item_id, stream_index, "cancelled subtitle extraction after playback stopped");
+            return Ok(StatusCode::NO_CONTENT.into_response());
+        };
         if !output
             .status
             .success()
@@ -789,10 +868,15 @@ async fn subtitles_stream_inner(
         stream_index,
         cache_codec,
         source_codec,
+        playback,
     )
     .await
     {
-        Ok(p) => p,
+        Ok(Some(path)) => path,
+        Ok(None) => {
+            debug!(%item_id, stream_index, "cancelled subtitle extraction after playback stopped");
+            return Ok(StatusCode::NO_CONTENT.into_response());
+        }
         Err(e) => {
             error!(%item_id, stream_index, %map_spec, "subtitle extraction failed: {e}");
             return Ok(Response::builder()
@@ -1015,6 +1099,45 @@ mod tests {
 
     use crate::integration_test::{auth_header_with_token, authenticated_server};
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn subtitle_process_is_cancelled_when_playback_ends() {
+        let temp = tempfile::tempdir().unwrap();
+        let sessions = PlaybackSessionManager::new(temp.path());
+        let play_session_id = "subtitle-cancellation";
+        sessions.begin_startup(
+            play_session_id,
+            Uuid::nil(),
+            Uuid::nil(),
+            "test-device",
+            "test-client",
+        );
+
+        let extraction = tokio::spawn({
+            let sessions = sessions.clone();
+            async move {
+                let mut cmd = tokio::process::Command::new("sh");
+                cmd.args(["-c", "sleep 30"]);
+                run_subtitle_command(
+                    &mut cmd,
+                    Some((sessions, play_session_id.to_string())),
+                )
+                .await
+            }
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(!extraction.is_finished());
+
+        sessions.abandon_startup(play_session_id, "test completed");
+        let output =
+            tokio::time::timeout(std::time::Duration::from_secs(2), extraction)
+                .await
+                .expect("subtitle process should stop promptly")
+                .expect("subtitle task should not panic")
+                .expect("subtitle cancellation should not fail");
+        assert!(output.is_none());
+    }
+
     #[test]
     fn torrent_sidecars_follow_existing_stream_indexes() {
         let mut source = api::MediaSourceInfo {
@@ -1056,6 +1179,11 @@ mod tests {
                 .as_deref(),
             Some("subrip")
         );
+    }
+
+    #[test]
+    fn external_subtitles_follow_torrent_sidecars() {
+        assert_eq!(next_external_subtitle_index([0, 1], [2]), 3);
     }
 
     /// Jellyfin's tickless subtitle route (`.../Subtitles/{index}/Stream.{format}`,

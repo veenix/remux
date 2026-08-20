@@ -887,7 +887,12 @@ pub static JS: &str = r#"
     if (generation !== playGeneration
         || !document.documentElement.classList.contains(STARTING_CLASS)) return;
 
-    renderStartupStatus(null);
+    // Render the fallback only once. Replacing the last server-reported phase
+    // before every poll makes the title flash between "Preparing playback"
+    // and the real phase while the request is in flight.
+    if (!document.querySelector('.remux-startup-status')) {
+      renderStartupStatus(null);
+    }
     var apiClient = window.ApiClient;
     if (!apiClient || !window.fetch) {
       scheduleStartupStatus(generation, 250);
@@ -1054,5 +1059,10 @@ mod tests {
     fn startup_status_shows_eta_without_a_cancellation_hint() {
         assert!(JS.contains("Estimated start in"));
         assert!(!JS.contains("Back cancels"));
+    }
+
+    #[test]
+    fn startup_status_keeps_the_last_phase_between_polls() {
+        assert!(JS.contains("if (!document.querySelector('.remux-startup-status'))"));
     }
 }

@@ -1698,6 +1698,66 @@ mod tests {
     }
 
     #[test]
+    fn client_delivered_subtitles_keep_the_concrete_source_id() {
+        let concrete_id = uuid::Uuid::new_v4();
+        let client_id = uuid::Uuid::new_v4();
+        let concrete = concrete_id.to_string();
+        let mut streams = vec![
+            crate::api::MediaStream {
+                type_: Some(crate::api::MediaStreamType::Subtitle),
+                is_external: true,
+                delivery_method: Some(crate::api::SubtitleDeliveryMethod::External),
+                delivery_url: Some(format!(
+                    "/Videos/item/{concrete}/Subtitles/2/0/Stream.vtt"
+                )),
+                ..Default::default()
+            },
+            crate::api::MediaStream {
+                type_: Some(crate::api::MediaStreamType::Subtitle),
+                is_external: false,
+                delivery_method: Some(crate::api::SubtitleDeliveryMethod::External),
+                delivery_url: Some(format!(
+                    "/Videos/item/{concrete}/Subtitles/3/0/Stream.vtt"
+                )),
+                ..Default::default()
+            },
+            crate::api::MediaStream {
+                type_: Some(crate::api::MediaStreamType::Subtitle),
+                is_external: false,
+                delivery_method: Some(crate::api::SubtitleDeliveryMethod::External),
+                delivery_url: Some(format!(
+                    "/Videos/item/{concrete}/Subtitles/4/0/Stream.vtt"
+                )),
+                index: 4,
+                ..Default::default()
+            },
+        ];
+
+        super::rewrite_aliased_subtitle_source_ids(
+            &mut streams,
+            concrete_id,
+            client_id,
+            &[4],
+        );
+
+        for stream in &streams[..2] {
+            let delivery = stream
+                .delivery_url
+                .as_deref()
+                .unwrap();
+            assert!(delivery.contains(&concrete));
+            assert!(!delivery.contains(&client_id.to_string()));
+        }
+        assert!(
+            streams[2]
+                .delivery_url
+                .as_deref()
+                .unwrap()
+                .contains(&client_id.to_string())
+        );
+    }
+
+    #[test]
     fn manual_and_in_play_audio_selections_remain_explicit() {
         let mut manual = crate::api::PlaybackInfoQuery {
             audio_stream_index: Some(2),

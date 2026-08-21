@@ -2087,6 +2087,17 @@ async fn create_hls_session(
             )
             .await?;
         }
+        if let Some(advertised_source_id) = q.media_source_id {
+            crate::api::subtitles::remap_torrent_subtitle_routes(
+                &state.ctx,
+                &auth
+                    .device
+                    .id,
+                id,
+                advertised_source_id,
+                &resolved_media,
+            );
+        }
         let source_changed = resolved_media.id != pre_hedge_source_id;
         state
             .ctx

@@ -41,12 +41,12 @@ pub(crate) struct TorrentPreflight {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct TorrentSidecarSubtitle {
-    pub file_idx: usize,
-    pub path: String,
-    pub language: Option<String>,
-    pub is_forced: bool,
-    pub is_hearing_impaired: bool,
+struct SidecarSubtitleFile {
+    file_idx: usize,
+    path: String,
+    language: Option<String>,
+    is_forced: bool,
+    is_hearing_impaired: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -321,34 +321,35 @@ impl TorrentManager {
         })
     }
 
-    /// Return text subtitle files associated with the selected video in a
-    /// torrent whose metadata has already been fetched. This never starts a
-    /// download; bytes are requested only if the client selects a subtitle.
-    pub(crate) fn subtitle_sidecars(
-        &self,
-        descriptor: &crate::stream::StreamDescriptor,
-    ) -> Vec<TorrentSidecarSubtitle> {
-        let crate::stream::StreamDescriptor::Torrent {
-            info_hash,
-            file_hint,
-            file_idx,
-            ..
-        } = descriptor
-        else {
-            return Vec::new();
-        };
-        let Some(metadata) = self
-            .preflight_cache
-            .get(&info_hash.to_ascii_lowercase())
-        else {
-            return Vec::new();
-        };
-        let Ok(selected_idx) =
-            select_file_index(&metadata.files, *file_idx, file_hint.as_deref())
-        else {
-            return Vec::new();
-        };
-        select_sidecar_subtitles(&metadata.files, selected_idx)
+    fn managed_torrent_files(&self, info_hash: &str) -> Option<Vec<CachedTorrentFile>> {
+        let api = Api::new(
+            self.session
+                .clone(),
+            None,
+            None,
+        );
+        let torrent_id = api
+            .api_torrent_list()
+            .torrents
+            .into_iter()
+            .find(|torrent| {
+                torrent
+                    .info_hash
+                    .eq_ignore_ascii_case(info_hash)
+            })?
+            .id?;
+        api.api_torrent_details(TorrentIdOrHash::Id(torrent_id))
+            .ok()?
+            .files
+            .map(|files| {
+                files
+                    .into_iter()
+                    .map(|file| CachedTorrentFile {
+                        name: file.name,
+                        length: file.length,
+                    })
+                    .collect()
+            })
     }
 
     /// Gracefully shut down the librqbit session, releasing all sockets
@@ -779,15 +780,9 @@ impl TorrentManager {
                         .clone()
                 })
                 .unwrap_or_default();
-            let files = torrent
-                .and_then(|torrent| torrent.files)
-                .unwrap_or_default()
-                .into_iter()
-                .map(|file| CachedTorrentFile {
-                    name: file.name,
-                    length: file.length,
-                })
-                .collect::<Vec<_>>();
+            let files = self
+                .managed_torrent_files(&info_hash)
+                .unwrap_or_default();
             let selected_idx = select_file_index(
                 &files,
                 parse_file_idx_param(magnet),
@@ -1490,6 +1485,59 @@ impl TorrentManager {
     }
 }
 
+impl crate::stream::StreamInfo {
+    /// Return text subtitle files associated with this stream when its torrent
+    /// metadata has already been fetched. This never starts a download; bytes
+    /// are requested only if the client selects a subtitle.
+    pub(crate) fn subtitle_sidecars(
+        &self,
+        torrent: &TorrentManager,
+    ) -> Vec<crate::addons::SubtitleInfo> {
+        let crate::stream::StreamDescriptor::Torrent {
+            info_hash,
+            file_hint,
+            file_idx,
+            trackers,
+        } = &self.descriptor
+        else {
+            return Vec::new();
+        };
+        let files = torrent
+            .preflight_cache
+            .get(&info_hash.to_ascii_lowercase())
+            .map(|metadata| {
+                metadata
+                    .files
+                    .clone()
+            })
+            .or_else(|| torrent.managed_torrent_files(info_hash));
+        let Some(files) = files else {
+            return Vec::new();
+        };
+        let Ok(selected_idx) =
+            select_file_index(&files, *file_idx, file_hint.as_deref())
+        else {
+            return Vec::new();
+        };
+
+        select_sidecar_subtitles(&files, selected_idx)
+            .into_iter()
+            .map(|sidecar| crate::addons::SubtitleInfo {
+                id: format!("torrent:{info_hash}:{}", sidecar.file_idx),
+                url: Some(crate::stream::StreamDescriptor::Torrent {
+                    info_hash: info_hash.clone(),
+                    file_hint: Some(sidecar.path),
+                    file_idx: Some(sidecar.file_idx),
+                    trackers: trackers.clone(),
+                }),
+                lang: sidecar.language,
+                is_forced: sidecar.is_forced,
+                is_hi: sidecar.is_hearing_impaired,
+            })
+            .collect()
+    }
+}
+
 struct StorageEntry {
     id: usize,
     info_hash: String,
@@ -1793,17 +1841,45 @@ fn subtitle_language_from_name(name: &str) -> Option<String> {
         .file_stem()
         .and_then(|stem| stem.to_str())
         .unwrap_or_default();
-    stem.split(|c: char| !c.is_ascii_alphabetic())
+    stem.split(|character: char| !character.is_ascii_alphabetic())
         .rev()
         .find_map(|token| {
-            remux_sdks::remux::lang_to_two_letter(&token.to_ascii_lowercase())
+            let lowercase = token.to_ascii_lowercase();
+            if matches!(
+                lowercase.as_str(),
+                "cc" | "default"
+                    | "forced"
+                    | "foreign"
+                    | "sdh"
+                    | "signs"
+                    | "hearing"
+                    | "impaired"
+                    | "hearingimpaired"
+            ) || token == "HI"
+            {
+                return None;
+            }
+            remux_sdks::remux::lang_to_two_letter(&lowercase)
         })
+}
+
+fn subtitle_stem_matches_video(selected_stem: &str, subtitle_stem: &str) -> bool {
+    !selected_stem.is_empty()
+        && subtitle_stem
+            .strip_prefix(selected_stem)
+            .is_some_and(|suffix| {
+                suffix.is_empty()
+                    || suffix
+                        .chars()
+                        .next()
+                        .is_some_and(|character| !character.is_ascii_alphanumeric())
+            })
 }
 
 fn select_sidecar_subtitles(
     files: &[CachedTorrentFile],
     selected_idx: usize,
-) -> Vec<TorrentSidecarSubtitle> {
+) -> Vec<SidecarSubtitleFile> {
     let Some(selected) = files.get(selected_idx) else {
         return Vec::new();
     };
@@ -1858,7 +1934,7 @@ fn select_sidecar_subtitles(
                 .unwrap_or_default()
                 .to_ascii_lowercase();
             let basename_matches =
-                !selected_stem.is_empty() && subtitle_stem.starts_with(&selected_stem);
+                subtitle_stem_matches_video(&selected_stem, &subtitle_stem);
             let same_directory = subtitle_parent == selected_parent;
             let in_subtitle_directory = subtitle_parent
                 .file_name()
@@ -1884,7 +1960,7 @@ fn select_sidecar_subtitles(
                 .split(|c: char| !c.is_ascii_alphanumeric())
                 .filter(|token| !token.is_empty())
                 .collect();
-            Some(TorrentSidecarSubtitle {
+            Some(SidecarSubtitleFile {
                 file_idx,
                 path: normalized.clone(),
                 language: subtitle_language_from_name(&normalized),
@@ -1910,11 +1986,13 @@ fn select_file_index(
         anyhow::bail!("torrent contains no files");
     }
     if let Some(wanted) = wanted_file {
+        let wanted_is_sidecar = is_supported_sidecar_subtitle(wanted);
         if let Some((idx, _)) = files
             .iter()
             .enumerate()
             .find(|(_, file)| {
-                is_video_file(&file.name)
+                (is_video_file(&file.name)
+                    || (wanted_is_sidecar && is_supported_sidecar_subtitle(&file.name)))
                     && (file
                         .name
                         .eq_ignore_ascii_case(wanted)
@@ -2096,6 +2174,20 @@ mod tests {
     }
 
     #[test]
+    fn exact_sidecar_hint_selects_subtitle_file() {
+        let files = vec![
+            file("Movie.2016.1080p.mp4", 2_000),
+            file("Subs/2_English.srt", 20),
+            file("RARBG.txt", 1),
+        ];
+
+        assert_eq!(
+            select_file_index(&files, Some(1), Some("Subs/2_English.srt"),).unwrap(),
+            1
+        );
+    }
+
+    #[test]
     fn single_movie_release_exposes_generic_subtitle_directory() {
         let files = vec![
             file("Movie.2016.1080p.mp4", 2_000),
@@ -2139,9 +2231,10 @@ mod tests {
     fn episode_pack_exposes_only_filename_matched_sidecar() {
         let files = vec![
             file("Show.S01E01.mkv", 1_000),
-            file("Show.S01E01.en.forced.srt", 10),
+            file("Show.S01E01.en.HI.forced.srt", 10),
             file("Show.S01E02.mkv", 1_000),
             file("Show.S01E02.en.srt", 10),
+            file("Show.S01E010.en.srt", 10),
         ];
 
         let subtitles = select_sidecar_subtitles(&files, 0);
@@ -2154,6 +2247,7 @@ mod tests {
             Some("en")
         );
         assert!(subtitles[0].is_forced);
+        assert!(subtitles[0].is_hearing_impaired);
     }
 
     #[test]

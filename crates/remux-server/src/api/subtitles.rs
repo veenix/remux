@@ -249,6 +249,187 @@ async fn fetch_external_subtitle_bytes(
         .map_err(|e| anyhow!("read subtitle bytes: {e}"))
 }
 
+#[derive(Clone)]
+pub(crate) struct TorrentSubtitleRoute {
+    pub index: i64,
+    pub subtitle: crate::addons::SubtitleInfo,
+}
+
+fn torrent_subtitle_routes_key(
+    device_id: &str,
+    item_id: Uuid,
+    media_source_id: Uuid,
+) -> String {
+    format!("torrent-subtitle-routes:{device_id}:{item_id}:{media_source_id}")
+}
+
+/// Build subtitle descriptors from cached torrent metadata. The metadata scan
+/// does not start a download; each descriptor targets only its small sidecar
+/// file if the client later requests that track.
+pub(crate) fn torrent_sidecars_for_media(
+    ctx: &crate::AppContext,
+    media: &crate::db::Media,
+) -> Vec<crate::addons::SubtitleInfo> {
+    media
+        .stream_info
+        .as_ref()
+        .map(|stream| stream.subtitle_sidecars(&ctx.torrent))
+        .unwrap_or_default()
+}
+
+/// Resolve only torrent metadata for the source selected for playback, then
+/// expose any SubRip sidecars. This performs no piece download or file
+/// allocation, and the cached metadata is reused by the actual torrent start.
+pub(crate) async fn prepare_torrent_sidecars_for_playback(
+    ctx: &crate::AppContext,
+    media: &crate::db::Media,
+) -> Vec<crate::addons::SubtitleInfo> {
+    let cached = torrent_sidecars_for_media(ctx, media);
+    if !cached.is_empty() {
+        return cached;
+    }
+    let Some(magnet) = media
+        .stream_info
+        .as_ref()
+        .and_then(|info| info.torrent_magnet())
+    else {
+        return cached;
+    };
+    if let Err(error) = ctx
+        .torrent
+        .preflight(&magnet, &[], std::time::Duration::from_millis(3800))
+        .await
+    {
+        debug!(%error, media_source_id = %media.id, "torrent subtitle metadata unavailable");
+    }
+    torrent_sidecars_for_media(ctx, media)
+}
+
+/// Append torrent sidecars after embedded tracks and return the index mapping
+/// used by the subtitle endpoint. Keeping the mapping in request-scoped cache
+/// avoids encoding torrent descriptors in client-visible URLs.
+pub(crate) fn inject_torrent_sidecars(
+    source: &mut api::MediaSourceInfo,
+    subtitles: Vec<crate::addons::SubtitleInfo>,
+) -> Vec<TorrentSubtitleRoute> {
+    let next_idx = source
+        .media_streams
+        .iter()
+        .map(|stream| stream.index)
+        .max()
+        .map_or(0, |index| index + 1);
+
+    subtitles
+        .into_iter()
+        .enumerate()
+        .map(|(offset, subtitle)| {
+            let index = next_idx + offset as i64;
+            let mut stream = crate::conversions::subtitle_to_media_stream(&subtitle);
+            stream.index = index;
+            source
+                .media_streams
+                .push(stream);
+            TorrentSubtitleRoute { index, subtitle }
+        })
+        .collect()
+}
+
+pub(crate) fn save_torrent_subtitle_routes(
+    ctx: &crate::AppContext,
+    device_id: &str,
+    item_id: Uuid,
+    media_source_id: Uuid,
+    routes: Vec<TorrentSubtitleRoute>,
+) {
+    if routes.is_empty() {
+        return;
+    }
+    ctx.store
+        .save(
+            torrent_subtitle_routes_key(device_id, item_id, media_source_id),
+            routes,
+            std::time::Duration::from_secs(6 * 60 * 60),
+        );
+}
+
+/// Auto playback may switch releases after PlaybackInfo has advertised track
+/// indexes. Preserve those indexes while retargeting matching tracks to the
+/// empirically selected release.
+pub(crate) fn remap_torrent_subtitle_routes(
+    ctx: &crate::AppContext,
+    device_id: &str,
+    item_id: Uuid,
+    media_source_id: Uuid,
+    selected_media: &crate::db::Media,
+) {
+    let key = torrent_subtitle_routes_key(device_id, item_id, media_source_id);
+    let Some(existing) = ctx
+        .store
+        .get::<Vec<TorrentSubtitleRoute>>(&key)
+    else {
+        return;
+    };
+    let replacements = torrent_sidecars_for_media(ctx, selected_media);
+    if replacements.is_empty() {
+        return;
+    }
+
+    let mut used = vec![false; replacements.len()];
+    let mut remapped = existing
+        .as_ref()
+        .clone();
+    for entry in &mut remapped {
+        let exact = replacements
+            .iter()
+            .enumerate()
+            .position(|(index, candidate)| {
+                !used[index]
+                    && candidate.lang
+                        == entry
+                            .subtitle
+                            .lang
+                    && candidate.is_forced
+                        == entry
+                            .subtitle
+                            .is_forced
+                    && candidate.is_hi
+                        == entry
+                            .subtitle
+                            .is_hi
+            });
+        let same_language = replacements
+            .iter()
+            .enumerate()
+            .position(|(index, candidate)| {
+                !used[index]
+                    && candidate.lang
+                        == entry
+                            .subtitle
+                            .lang
+            });
+        if let Some(index) = exact.or(same_language) {
+            used[index] = true;
+            entry.subtitle = replacements[index].clone();
+        }
+    }
+    ctx.store
+        .save(key, remapped, std::time::Duration::from_secs(6 * 60 * 60));
+}
+
+fn load_torrent_subtitle_routes(
+    ctx: &crate::AppContext,
+    device_id: &str,
+    item_id: Uuid,
+    media_source_id: Uuid,
+) -> Option<std::sync::Arc<Vec<TorrentSubtitleRoute>>> {
+    ctx.store
+        .get::<Vec<TorrentSubtitleRoute>>(&torrent_subtitle_routes_key(
+            device_id,
+            item_id,
+            media_source_id,
+        ))
+}
+
 fn external_subtitle_response(
     bytes: axum::body::Bytes,
     output_format: &str,
@@ -274,92 +455,9 @@ fn external_subtitle_response(
         .unwrap()
 }
 
-#[derive(Clone)]
-pub(crate) struct SidecarSubtitleRoute {
-    index: i64,
-    subtitle: crate::addons::SubtitleInfo,
-}
-
-fn sidecar_subtitle_routes_key(
-    device_id: &str,
-    item_id: Uuid,
-    media_source_id: Uuid,
-) -> String {
-    format!("sidecar-subtitle-routes:{device_id}:{item_id}:{media_source_id}")
-}
-
-fn next_external_subtitle_index(
-    source_indices: impl IntoIterator<Item = i64>,
-    sidecar_indices: impl IntoIterator<Item = i64>,
-) -> i64 {
-    source_indices
-        .into_iter()
-        .chain(sidecar_indices)
-        .max()
-        .map_or(0, |index| index + 1)
-}
-
-pub(crate) fn inject_sidecar_subtitles(
-    source: &mut api::MediaSourceInfo,
-    subtitles: Vec<crate::addons::SubtitleInfo>,
-) -> Vec<SidecarSubtitleRoute> {
-    let next_idx = source
-        .media_streams
-        .iter()
-        .map(|stream| stream.index)
-        .max()
-        .map_or(0, |index| index + 1);
-
-    subtitles
-        .into_iter()
-        .enumerate()
-        .map(|(offset, subtitle)| {
-            let index = next_idx + offset as i64;
-            let mut stream = crate::conversions::subtitle_to_media_stream(&subtitle);
-            stream.index = index;
-            source
-                .media_streams
-                .push(stream);
-            SidecarSubtitleRoute { index, subtitle }
-        })
-        .collect()
-}
-
-pub(crate) fn save_sidecar_subtitle_routes(
-    ctx: &crate::AppContext,
-    device_id: &str,
-    item_id: Uuid,
-    media_source_id: Uuid,
-    routes: Vec<SidecarSubtitleRoute>,
-) {
-    if routes.is_empty() {
-        return;
-    }
-    ctx.store
-        .save(
-            sidecar_subtitle_routes_key(device_id, item_id, media_source_id),
-            routes,
-            std::time::Duration::from_secs(6 * 60 * 60),
-        );
-}
-
-fn load_sidecar_subtitle_routes(
-    ctx: &crate::AppContext,
-    device_id: &str,
-    item_id: Uuid,
-    media_source_id: Uuid,
-) -> Option<std::sync::Arc<Vec<SidecarSubtitleRoute>>> {
-    ctx.store
-        .get::<Vec<SidecarSubtitleRoute>>(&sidecar_subtitle_routes_key(
-            device_id,
-            item_id,
-            media_source_id,
-        ))
-}
-
-async fn sidecar_subtitle_response(
+async fn torrent_sidecar_subtitle_response(
     state: &AppState,
-    routes: Option<&[SidecarSubtitleRoute]>,
+    routes: Option<&[TorrentSubtitleRoute]>,
     item_id: Uuid,
     media_source_id: Uuid,
     stream_index: i64,
@@ -380,7 +478,7 @@ async fn sidecar_subtitle_response(
             }
             Err(error) => {
                 warn!(%error, %item_id, %media_source_id, stream_index,
-                "sidecar subtitle unavailable");
+                    "torrent sidecar subtitle unavailable");
                 (StatusCode::NOT_FOUND, "subtitle unavailable").into_response()
             }
         },
@@ -395,7 +493,7 @@ async fn subtitles_stream_inner(
     stream_index: i64,
     format: String,
 ) -> Result<impl IntoResponse> {
-    let sidecar_routes = load_sidecar_subtitle_routes(
+    let torrent_routes = load_torrent_subtitle_routes(
         &state.ctx,
         &session
             .device
@@ -403,9 +501,9 @@ async fn subtitles_stream_inner(
         item_id,
         media_source_id,
     );
-    if let Some(response) = sidecar_subtitle_response(
+    if let Some(response) = torrent_sidecar_subtitle_response(
         &state,
-        sidecar_routes
+        torrent_routes
             .as_ref()
             .map(|routes| routes.as_slice()),
         item_id,
@@ -454,15 +552,15 @@ async fn subtitles_stream_inner(
                         .collect()
                 })
                 .unwrap_or_default();
-            // Sidecars are inserted before add-on subtitles in PlaybackInfo,
-            // but are not present in the source's probe data. Include their
-            // advertised indexes so the requested add-on matches the selected
-            // menu entry.
+            // Torrent sidecars are inserted before add-on subtitles in
+            // PlaybackInfo, but are not part of the source's probe data. Include
+            // their advertised indexes so an add-on request resolves to the same
+            // entry that the client selected.
             let next_idx = next_external_subtitle_index(
                 embedded_indices
                     .iter()
                     .copied(),
-                sidecar_routes
+                torrent_routes
                     .as_deref()
                     .into_iter()
                     .flatten()
@@ -509,7 +607,7 @@ async fn subtitles_stream_inner(
                             Ok(bytes) => {
                                 return Ok(external_subtitle_response(
                                     bytes,
-                                    &output_format,
+                                    output_format.as_str(),
                                 ));
                             }
                             Err(e) => {
@@ -736,6 +834,10 @@ pub(crate) fn subtitle_path_hint(sub: &crate::addons::SubtitleInfo) -> &str {
         Some(crate::stream::StreamDescriptor::Local(p)) => p
             .to_str()
             .unwrap_or(""),
+        Some(crate::stream::StreamDescriptor::Torrent {
+            file_hint: Some(path),
+            ..
+        }) => path.as_str(),
         Some(crate::stream::StreamDescriptor::Opendal { path, .. }) => path.as_str(),
         _ => "",
     }
@@ -913,6 +1015,49 @@ mod tests {
 
     use crate::integration_test::{auth_header_with_token, authenticated_server};
 
+    #[test]
+    fn torrent_sidecars_follow_existing_stream_indexes() {
+        let mut source = api::MediaSourceInfo {
+            media_streams: vec![
+                api::MediaStream {
+                    index: 0,
+                    type_: Some(api::MediaStreamType::Video),
+                    ..Default::default()
+                },
+                api::MediaStream {
+                    index: 2,
+                    type_: Some(api::MediaStreamType::Audio),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        let subtitle = crate::addons::SubtitleInfo {
+            id: "torrent-sidecar".to_string(),
+            url: Some(crate::stream::StreamDescriptor::Torrent {
+                info_hash: "a".repeat(40),
+                file_hint: Some("Subs/English.srt".to_string()),
+                file_idx: Some(4),
+                trackers: Vec::new(),
+            }),
+            lang: Some("en".to_string()),
+            is_forced: false,
+            is_hi: false,
+        };
+
+        let routes = inject_torrent_sidecars(&mut source, vec![subtitle]);
+
+        assert_eq!(routes.len(), 1);
+        assert_eq!(routes[0].index, 3);
+        assert_eq!(source.media_streams[2].index, 3);
+        assert_eq!(
+            source.media_streams[2]
+                .codec
+                .as_deref(),
+            Some("subrip")
+        );
+    }
+
     /// Jellyfin's tickless subtitle route (`.../Subtitles/{index}/Stream.{format}`,
     /// no start-position-ticks segment) must dispatch to the same handler as the
     /// canonical route. With a non-existent item both produce the identical
@@ -993,50 +1138,5 @@ mod tests {
 
         assert_eq!(cache, api::SubtitleCodec::Ass);
         assert_eq!(subtitle_cache_ffmpeg_codec(&cache, Some("subrip")), "ass");
-    }
-
-    #[test]
-    fn sidecars_follow_existing_stream_indexes() {
-        let mut source = api::MediaSourceInfo {
-            media_streams: vec![
-                api::MediaStream {
-                    index: 0,
-                    type_: Some(api::MediaStreamType::Video),
-                    ..Default::default()
-                },
-                api::MediaStream {
-                    index: 2,
-                    type_: Some(api::MediaStreamType::Audio),
-                    ..Default::default()
-                },
-            ],
-            ..Default::default()
-        };
-        let subtitles = vec![crate::addons::SubtitleInfo {
-            id: "sidecar-4".to_string(),
-            url: Some(crate::stream::StreamDescriptor::http(
-                "https://example.com/Movie.en.srt",
-            )),
-            lang: Some("en".to_string()),
-            is_forced: false,
-            is_hi: false,
-        }];
-
-        let routes = inject_sidecar_subtitles(&mut source, subtitles);
-
-        assert_eq!(routes.len(), 1);
-        assert_eq!(routes[0].index, 3);
-        assert_eq!(source.media_streams[2].index, 3);
-        assert_eq!(
-            source.media_streams[2]
-                .codec
-                .as_deref(),
-            Some("subrip")
-        );
-    }
-
-    #[test]
-    fn external_subtitles_follow_sidecars() {
-        assert_eq!(next_external_subtitle_index([0, 1], [2]), 3);
     }
 }

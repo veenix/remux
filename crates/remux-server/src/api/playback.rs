@@ -2,8 +2,9 @@ use anyhow::anyhow;
 use axum::Json;
 
 use super::subtitles::{
-    inject_external_subtitles, inject_sidecar_subtitles, save_sidecar_subtitle_routes,
-    scored_external_subtitles,
+    inject_external_subtitles, inject_torrent_sidecars,
+    prepare_torrent_sidecars_for_playback, save_torrent_subtitle_routes,
+    scored_external_subtitles, torrent_sidecars_for_media,
 };
 use axum::{
     body::Body,
@@ -125,6 +126,33 @@ fn apply_item_runtime_fallback(
     source.run_time_ticks = item_runtime_seconds
         .filter(|seconds| *seconds > 0)
         .and_then(|seconds| seconds.to_ticks(TickUnit::Seconds));
+}
+
+fn rewrite_aliased_subtitle_source_ids(
+    streams: &mut [api::MediaStream],
+    concrete_id: Uuid,
+    client_id: Uuid,
+    aliased_sidecar_indices: &[i64],
+) {
+    for stream in streams {
+        // Client-delivered embedded and add-on subtitles need a stored media
+        // row, so keep their concrete source ID. Torrent sidecars are the
+        // exception: their request-scoped route is saved under the client
+        // alias and must follow that alias.
+        if matches!(
+            stream.delivery_method,
+            Some(api::SubtitleDeliveryMethod::External)
+        ) && !aliased_sidecar_indices.contains(&stream.index)
+        {
+            continue;
+        }
+        if let Some(url) = stream
+            .delivery_url
+            .as_mut()
+        {
+            *url = url.replace(&concrete_id.to_string(), &client_id.to_string());
+        }
+    }
 }
 
 fn clear_initial_auto_audio_placeholder(
@@ -534,7 +562,7 @@ async fn items_playbackinfo_inner(
             .results
             .len(),
     );
-    let mut sidecar_subtitle_routes = Vec::with_capacity(
+    let mut torrent_subtitle_routes = Vec::with_capacity(
         probed
             .results
             .len(),
@@ -767,19 +795,12 @@ async fn items_playbackinfo_inner(
             TranscodeDecision::Transcode(outcome) => outcome.apply_to(&mut source),
         }
 
-        let sidecars = effective_stream
-            .stream_info
-            .as_ref()
-            .map(|stream| {
-                stream.subtitle_sidecars(
-                    &state
-                        .ctx
-                        .torrent,
-                )
-            })
-            .unwrap_or_default();
-        let routes = inject_sidecar_subtitles(&mut source, sidecars);
-        let subtitle_source_id = source.id;
+        let torrent_sidecars = if result_index == 0 || specific_stream_requested {
+            prepare_torrent_sidecars_for_playback(&state.ctx, &effective_stream).await
+        } else {
+            torrent_sidecars_for_media(&state.ctx, &effective_stream)
+        };
+        let routes = inject_torrent_sidecars(&mut source, torrent_sidecars);
 
         apply_subtitle_delivery(
             &mut source,
@@ -801,11 +822,11 @@ async fn items_playbackinfo_inner(
             }
         }
 
-        sidecar_subtitle_routes.push((subtitle_source_id, routes));
         if auto_requested.is_some() && media_sources.is_empty() {
             auto_session_winner_id = Some(effective_stream.id);
         }
         media_sources.push(source);
+        torrent_subtitle_routes.push(routes);
     }
 
     if !media_sources.is_empty() {
@@ -877,21 +898,38 @@ async fn items_playbackinfo_inner(
             .id,
     );
 
+    // Retain concrete ids because add-on subtitle URLs deliberately keep them
+    // even when the client-facing media source is aliased below.
+    let concrete_source_ids = media_sources
+        .iter()
+        .map(|source| source.id)
+        .collect::<Vec<_>>();
+
     // Preserve the synthetic Auto id so the client can correlate PlaybackInfo
     // with its requested source while the server uses the concrete winner.
     if let Some(auto_id) = auto_requested {
-        for s in &mut media_sources {
+        for (source_index, s) in media_sources
+            .iter_mut()
+            .enumerate()
+        {
             let concrete_id = s.id;
             s.id = auto_id;
             s.e_tag = auto_id;
-            for stream in &mut s.media_streams {
-                if let Some(url) = stream
-                    .delivery_url
-                    .as_mut()
-                {
-                    *url = url.replace(&concrete_id.to_string(), &auto_id.to_string());
-                }
-            }
+            let sidecar_indices = torrent_subtitle_routes
+                .get(source_index)
+                .map(|entries| {
+                    entries
+                        .iter()
+                        .map(|entry| entry.index)
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            rewrite_aliased_subtitle_source_ids(
+                &mut s.media_streams,
+                concrete_id,
+                auto_id,
+                &sidecar_indices,
+            );
             // HLS requests must carry the same synthetic id returned in the
             // MediaSourceInfo response.
             if let Some(url) = s
@@ -928,41 +966,46 @@ async fn items_playbackinfo_inner(
         let concrete_id = media_sources[0].id;
         media_sources[0].id = id;
         media_sources[0].e_tag = id;
-        for stream in &mut media_sources[0].media_streams {
-            if let Some(url) = stream
-                .delivery_url
-                .as_mut()
-            {
-                *url = url.replace(&concrete_id.to_string(), &id.to_string());
-            }
-        }
+        let sidecar_indices = torrent_subtitle_routes
+            .first()
+            .map(|entries| {
+                entries
+                    .iter()
+                    .map(|entry| entry.index)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        rewrite_aliased_subtitle_source_ids(
+            &mut media_sources[0].media_streams,
+            concrete_id,
+            id,
+            &sidecar_indices,
+        );
     }
 
-    for (source, (delivery_source_id, routes)) in media_sources
+    for ((source, concrete_id), routes) in media_sources
         .iter()
-        .zip(sidecar_subtitle_routes)
+        .zip(concrete_source_ids)
+        .zip(torrent_subtitle_routes)
     {
-        // DeliveryUrl contains the source ID from apply_subtitle_delivery, while
-        // some clients construct the route from the final MediaSourceInfo ID.
-        // Cache both keys when auto-play rewrites the first source ID.
-        if source.id != delivery_source_id {
-            save_sidecar_subtitle_routes(
+        if concrete_id != source.id {
+            save_torrent_subtitle_routes(
                 &state.ctx,
                 &session
                     .device
                     .id,
                 id,
-                source.id,
+                concrete_id,
                 routes.clone(),
             );
         }
-        save_sidecar_subtitle_routes(
+        save_torrent_subtitle_routes(
             &state.ctx,
             &session
                 .device
                 .id,
             id,
-            delivery_source_id,
+            source.id,
             routes,
         );
     }

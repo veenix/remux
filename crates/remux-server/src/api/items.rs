@@ -2241,6 +2241,49 @@ async fn item_for_user(
             })
             .unwrap_or_default();
         if let Some(ref mut sources) = base_item.media_sources {
+            if let Some(concrete_sources) = media
+                .sources
+                .as_deref()
+            {
+                for (source, concrete) in sources
+                    .iter_mut()
+                    .zip(concrete_sources)
+                {
+                    let routes = super::subtitles::inject_torrent_sidecars(
+                        source,
+                        super::subtitles::torrent_sidecars_for_media(
+                            &state.ctx, concrete,
+                        ),
+                    );
+                    for entry in &routes {
+                        if let Some(stream) = source
+                            .media_streams
+                            .iter_mut()
+                            .find(|stream| stream.index == entry.index)
+                        {
+                            stream.delivery_url = Some(format!(
+                                "/Videos/{}/{}/Subtitles/{}/0/Stream.vtt?ApiKey={}",
+                                media.id,
+                                source.id,
+                                entry.index,
+                                session
+                                    .device
+                                    .access_token
+                                    .expose(),
+                            ));
+                        }
+                    }
+                    super::subtitles::save_torrent_subtitle_routes(
+                        &state.ctx,
+                        &session
+                            .device
+                            .id,
+                        media.id,
+                        source.id,
+                        routes,
+                    );
+                }
+            }
             // Default audio/subtitle stream indexes are per-request API values
             // (never persisted) — derive them here for the detail page.
             for source in sources.iter_mut() {

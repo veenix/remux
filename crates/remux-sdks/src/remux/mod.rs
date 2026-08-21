@@ -4192,7 +4192,7 @@ pub enum CollectionType {
     Folders,
 }
 
-#[derive(Debug, Deserialize, Default)]
+#[derive(Clone, Debug, Deserialize, Default)]
 #[serde(rename_all = "PascalCase")]
 pub struct HlsVideoQuery {
     #[serde(alias = "playSessionId")]

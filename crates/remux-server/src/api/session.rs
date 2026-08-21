@@ -1414,6 +1414,12 @@ pub async fn delete_transcoding(
 ) -> Result<impl IntoResponse> {
     if let Some(play_session_id) = q.play_session_id {
         info!("Stopping transcode session: {}", play_session_id);
+        abandon_playback_startup(
+            &state,
+            &play_session_id,
+            "client cancelled playback startup",
+        )
+        .await;
         state
             .ctx
             .sessions

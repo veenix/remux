@@ -60,8 +60,8 @@ const HEDGE_TERTIARY_DELAY: Duration = Duration::from_millis(1_500);
 const HEDGE_LATE_DELAY: Duration = Duration::from_secs(3);
 const HEDGE_PROBE_WINDOW: Duration = Duration::from_secs(8);
 // Jellyfin Web retries an unanswered master playlist at roughly 20 seconds.
-// Finish one server-side decision before that deadline so a client retry cannot
-// cancel and restart a second hedge for the same PlaySessionId.
+// Keep the fast path below that deadline; slower patient probes continue in
+// request-independent session creation and retries wait for the same result.
 const HEDGE_TOTAL_BUDGET: Duration = Duration::from_secs(15);
 // If the fast hedge cannot find a streamable source, keep every candidate
 // connected long enough for tracker/DHT discovery and slow peers to mature.
@@ -1902,9 +1902,133 @@ async fn is_auto_media_source(
     false
 }
 
+async fn record_hls_startup_failure(
+    state: &AppState,
+    play_session_id: &str,
+    item_id: Uuid,
+    error_text: &str,
+) {
+    if let Some(report) = state
+        .ctx
+        .sessions
+        .fail_startup(play_session_id, error_text)
+    {
+        if let Err(persist_error) = db::record_playback_startup(
+            &state
+                .ctx
+                .db,
+            &report,
+        )
+        .await
+        {
+            warn!(
+                %persist_error,
+                %play_session_id,
+                "failed to persist playback startup failure"
+            );
+        }
+        warn!(
+            %play_session_id,
+            %item_id,
+            error = %error_text,
+            "Playback startup failed"
+        );
+    }
+    clear_auto_prebuffer_plan(state, play_session_id);
+    StreamService::clear_auto_session_winner(
+        &state
+            .ctx
+            .store,
+        play_session_id,
+    );
+    state
+        .ctx
+        .torrent
+        .release_playback(play_session_id)
+        .await;
+}
+
 /// Shared session setup: look up or create the transcode session for an HLS
 /// request. Returns the session handle and the resolved play_session_id.
 async fn create_hls_session(
+    state: &AppState,
+    auth: &auth::AuthSession,
+    id: Uuid,
+    q: &api::HlsVideoQuery,
+) -> Result<(Arc<tokio::sync::RwLock<TranscodeSession>>, String)> {
+    let state = state.clone();
+    let auth = auth.clone();
+    let q = q.clone();
+    let tracked_play_session_id = q
+        .play_session_id
+        .clone()
+        .filter(|play_session_id| {
+            state
+                .ctx
+                .sessions
+                .has_startup(play_session_id)
+        });
+
+    // Jellyfin can abandon and retry a pending master-playlist request after
+    // roughly 20 seconds. Run session creation independently of that request
+    // so a patient torrent probe keeps its peers and progress; retries then
+    // wait on the same per-session lock and reuse the attached transcode.
+    tokio::spawn(async move {
+        let creation = create_hls_session_inner(&state, &auth, id, &q);
+        let Some(play_session_id) = tracked_play_session_id else {
+            return creation.await;
+        };
+        let device_id = auth
+            .device
+            .id
+            .clone();
+        let sessions = state
+            .ctx
+            .sessions
+            .clone();
+        let watched_play_session_id = play_session_id.clone();
+        tokio::select! {
+            result = creation => {
+                if let Err(error) = &result {
+                    record_hls_startup_failure(
+                        &state,
+                        &play_session_id,
+                        id,
+                        &format!("{error:?}"),
+                    )
+                    .await;
+                }
+                result
+            },
+            _ = async move {
+                loop {
+                    tokio::time::sleep(Duration::from_millis(250)).await;
+                    let is_current = sessions
+                        .startup_progress_for_device(&device_id)
+                        .is_some_and(|startup| {
+                            startup.play_session_id == watched_play_session_id
+                        });
+                    if !is_current {
+                        break;
+                    }
+                }
+            } => {
+                super::session::abandon_playback_startup(
+                    &state,
+                    &play_session_id,
+                    "playback startup was cancelled",
+                )
+                .await;
+                clear_auto_prebuffer_plan(&state, &play_session_id);
+                state.ctx.torrent.release_playback(&play_session_id).await;
+                Err(anyhow::anyhow!("playback startup was cancelled").into())
+            }
+        }
+    })
+    .await?
+}
+
+async fn create_hls_session_inner(
     state: &AppState,
     auth: &auth::AuthSession,
     id: Uuid,
@@ -2786,36 +2910,7 @@ pub async fn master_hls_video(
                 .play_session_id
                 .as_deref()
             {
-                if let Some(report) = state
-                    .ctx
-                    .sessions
-                    .fail_startup(play_session_id, error_text.clone())
-                {
-                    if let Err(persist_error) = db::record_playback_startup(
-                        &state
-                            .ctx
-                            .db,
-                        &report,
-                    )
-                    .await
-                    {
-                        warn!(
-                            %persist_error,
-                            %play_session_id,
-                            "failed to persist playback startup failure"
-                        );
-                    }
-                }
-                warn!(
-                    %play_session_id,
-                    item_id = %id,
-                    error = %error_text,
-                    "Playback startup failed"
-                );
-                state
-                    .ctx
-                    .torrent
-                    .release_playback(play_session_id)
+                record_hls_startup_failure(&state, play_session_id, id, &error_text)
                     .await;
             }
             return Ok(axum::response::Redirect::temporary("/videos/no-streams")

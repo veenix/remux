@@ -3384,6 +3384,21 @@ enum AutoSourceSwitch {
     Exhausted,
 }
 
+async fn exhaust_auto_startup(
+    state: &AppState,
+    play_session_id: &str,
+    item_id: Uuid,
+    reason: &str,
+) -> AutoSourceSwitch {
+    record_hls_startup_failure(state, play_session_id, item_id, reason).await;
+    state
+        .ctx
+        .sessions
+        .stop_transcode(play_session_id)
+        .await;
+    AutoSourceSwitch::Exhausted
+}
+
 async fn maybe_switch_slow_auto_source(
     state: &AppState,
     session: &Arc<tokio::sync::RwLock<TranscodeSession>>,
@@ -3460,43 +3475,13 @@ async fn maybe_switch_slow_auto_source(
             %old_source_id,
             "Auto startup fallback budget exhausted"
         );
-        StreamService::clear_auto_session_winner(
-            &state
-                .ctx
-                .store,
+        return exhaust_auto_startup(
+            state,
             play_session_id,
-        );
-        if let Some(report) = state
-            .ctx
-            .sessions
-            .fail_startup(play_session_id, "Auto startup fallback budget exhausted")
-        {
-            if let Err(error) = db::record_playback_startup(
-                &state
-                    .ctx
-                    .db,
-                &report,
-            )
-            .await
-            {
-                warn!(
-                    %error,
-                    %play_session_id,
-                    "failed to persist exhausted playback startup metric"
-                );
-            }
-        }
-        state
-            .ctx
-            .sessions
-            .stop_transcode(play_session_id)
-            .await;
-        state
-            .ctx
-            .torrent
-            .release_playback(play_session_id)
-            .await;
-        return AutoSourceSwitch::Exhausted;
+            item_id,
+            "Auto startup fallback budget exhausted",
+        )
+        .await;
     }
 
     let old_source = match db::Media::get_by_id(
@@ -3644,13 +3629,15 @@ async fn maybe_switch_slow_auto_source(
         {
             Ok(replacement) => (replacement, false),
             Err(error) => {
+                let reason = format!("Auto fallback selection failed: {error}");
                 warn!(
                     %play_session_id,
                     %old_source_id,
                     %error,
                     "Auto fallback selection failed"
                 );
-                return AutoSourceSwitch::NotNeeded;
+                return exhaust_auto_startup(state, play_session_id, item_id, &reason)
+                    .await;
             }
         }
     };

@@ -57,6 +57,13 @@ struct PlaybackStartup {
     first_segment_served: Option<Duration>,
 }
 
+#[derive(Clone)]
+struct PlaybackStartupFailure {
+    item_id: Uuid,
+    user_id: Uuid,
+    failed_at: Instant,
+}
+
 #[derive(Clone, Debug)]
 pub struct PlaybackStartupReport {
     pub play_session_id: String,
@@ -94,6 +101,7 @@ pub struct PlaybackStartupProgress {
 pub struct PlaybackSessionManager {
     sessions: Arc<DashMap<String, PlaybackSession>>,
     startups: Arc<DashMap<String, PlaybackStartup>>,
+    startup_failures: Arc<DashMap<String, PlaybackStartupFailure>>,
     base_dir: PathBuf,
 }
 
@@ -153,6 +161,7 @@ impl PlaybackSessionManager {
         Self {
             sessions: Arc::new(DashMap::new()),
             startups: Arc::new(DashMap::new()),
+            startup_failures: Arc::new(DashMap::new()),
             base_dir,
         }
     }
@@ -168,6 +177,17 @@ impl PlaybackSessionManager {
         device_id: &str,
         client_name: &str,
     ) {
+        // Jellyfin may automatically request PlaybackInfo again for the same
+        // item after its no-stream placeholder starts. Keep the terminal
+        // failure visible across that retry; a different item or an explicit
+        // client acknowledgement clears it.
+        let preserve_failure = self
+            .recent_startup_failure(device_id, user_id)
+            .is_some_and(|failure| failure.item_id == item_id);
+        if !preserve_failure {
+            self.startup_failures
+                .remove(device_id);
+        }
         if self
             .startups
             .len()
@@ -244,6 +264,41 @@ impl PlaybackSessionManager {
                 .first_segment_served
                 .is_some(),
         })
+    }
+
+    fn recent_startup_failure(
+        &self,
+        device_id: &str,
+        user_id: Uuid,
+    ) -> Option<PlaybackStartupFailure> {
+        let failure = self
+            .startup_failures
+            .get(device_id)
+            .map(|failure| {
+                failure
+                    .value()
+                    .clone()
+            })?;
+        let expired = failure
+            .failed_at
+            .elapsed()
+            > Duration::from_secs(5 * 60);
+        if expired {
+            self.startup_failures
+                .remove(device_id);
+            return None;
+        }
+        (failure.user_id == user_id).then_some(failure)
+    }
+
+    pub fn has_recent_startup_failure(&self, device_id: &str, user_id: Uuid) -> bool {
+        self.recent_startup_failure(device_id, user_id)
+            .is_some()
+    }
+
+    pub fn clear_startup_failure(&self, device_id: &str) {
+        self.startup_failures
+            .remove(device_id);
     }
 
     fn mark_startup<F>(&self, play_session_id: &str, update: F)
@@ -363,6 +418,8 @@ impl PlaybackSessionManager {
         let (_, startup) = self
             .startups
             .remove(play_session_id)?;
+        self.startup_failures
+            .remove(&startup.device_id);
         let confirmed = startup
             .started
             .elapsed();
@@ -387,7 +444,19 @@ impl PlaybackSessionManager {
         play_session_id: &str,
         reason: impl Into<String>,
     ) -> Option<PlaybackStartupReport> {
-        self.end_startup(play_session_id, "failed", reason)
+        let report = self.end_startup(play_session_id, "failed", reason)?;
+        self.startup_failures
+            .insert(
+                report
+                    .device_id
+                    .clone(),
+                PlaybackStartupFailure {
+                    item_id: report.item_id,
+                    user_id: report.user_id,
+                    failed_at: Instant::now(),
+                },
+            );
+        Some(report)
     }
 
     pub fn abandon_startup(
@@ -1430,6 +1499,44 @@ mod startup_metric_tests {
                 .play_session_id,
             "newer"
         );
+    }
+
+    #[test]
+    fn failed_startup_remains_visible_across_automatic_same_item_retry() {
+        let temp = tempfile::tempdir().unwrap();
+        let manager = PlaybackSessionManager::new(temp.path());
+        let user_id = Uuid::new_v4();
+        let item_id = Uuid::new_v4();
+
+        manager.begin_startup("failed", item_id, user_id, "device", "client");
+        manager
+            .fail_startup("failed", "no playable source")
+            .unwrap();
+
+        assert!(manager.has_recent_startup_failure("device", user_id));
+        manager.begin_startup("retry", item_id, user_id, "device", "client");
+        assert!(manager.has_recent_startup_failure("device", user_id));
+    }
+
+    #[test]
+    fn different_item_or_explicit_acknowledgement_clears_startup_failure() {
+        let temp = tempfile::tempdir().unwrap();
+        let manager = PlaybackSessionManager::new(temp.path());
+        let user_id = Uuid::new_v4();
+
+        manager.begin_startup("failed", Uuid::new_v4(), user_id, "device", "client");
+        manager
+            .fail_startup("failed", "no playable source")
+            .unwrap();
+        manager.begin_startup("different", Uuid::new_v4(), user_id, "device", "client");
+        assert!(!manager.has_recent_startup_failure("device", user_id));
+
+        manager
+            .fail_startup("different", "no playable source")
+            .unwrap();
+        assert!(manager.has_recent_startup_failure("device", user_id));
+        manager.clear_startup_failure("device");
+        assert!(!manager.has_recent_startup_failure("device", user_id));
     }
 
     #[tokio::test]

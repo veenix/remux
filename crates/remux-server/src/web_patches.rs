@@ -899,6 +899,15 @@ pub static JS: &str = r#"
       statusTimer = null;
     }
     startupFailed = true;
+    var apiClient = window.ApiClient;
+    if (apiClient && typeof apiClient.stopActiveEncodings === 'function') {
+      stopEncodingWhenAvailable(
+        apiClient,
+        playStartedAt,
+        playGeneration,
+        performance.now() + 30000
+      );
+    }
     var status = ensureStartupStatus(true);
     if (!status) return;
     status.classList.add('remux-startup-error');
@@ -959,6 +968,27 @@ pub static JS: &str = r#"
     }, delay);
   }
 
+  function fetchStartupStatus(apiClient) {
+    var url = apiClient.getUrl('Remux/Playback/Startup', { _: Date.now() });
+    return fetch(url, {
+      cache: 'no-store',
+      headers: { 'X-Emby-Token': apiClient.accessToken() }
+    }).then(function (response) {
+      if (!response.ok) throw new Error('startup status unavailable');
+      return response.json();
+    });
+  }
+
+  function clearStartupFailure(apiClient) {
+    if (!apiClient || !window.fetch) return;
+    var url = apiClient.getUrl('Remux/Playback/Startup');
+    fetch(url, {
+      method: 'DELETE',
+      cache: 'no-store',
+      headers: { 'X-Emby-Token': apiClient.accessToken() }
+    }).catch(function () {});
+  }
+
   function pollStartupStatus(generation) {
     if (generation !== playGeneration
         || startupFailed
@@ -976,16 +1006,13 @@ pub static JS: &str = r#"
       return;
     }
 
-    var url = apiClient.getUrl('Remux/Playback/Startup', { _: Date.now() });
-    fetch(url, {
-      cache: 'no-store',
-      headers: { 'X-Emby-Token': apiClient.accessToken() }
-    }).then(function (response) {
-      if (!response.ok) throw new Error('startup status unavailable');
-      return response.json();
-    }).then(function (startup) {
+    fetchStartupStatus(apiClient).then(function (startup) {
       if (generation !== playGeneration
           || !document.documentElement.classList.contains(STARTING_CLASS)) return;
+      if (startup && startup.Phase === 'failed') {
+        renderStartupError();
+        return;
+      }
       sawStartupStatus = true;
       startupUnavailableCount = 0;
       renderStartupStatus(startup);
@@ -1016,8 +1043,22 @@ pub static JS: &str = r#"
     var generation = playGeneration;
     setTimeout(function () {
       if (generation !== playGeneration || startupFailed) return;
-      if (isNoStreamsPlayback(target)) renderStartupError();
-      else clearStarting();
+      if (isNoStreamsPlayback(target)) {
+        renderStartupError();
+        return;
+      }
+      var apiClient = window.ApiClient;
+      if (!apiClient || !window.fetch) {
+        clearStarting();
+        return;
+      }
+      fetchStartupStatus(apiClient).then(function (startup) {
+        if (generation !== playGeneration || startupFailed) return;
+        if (startup && startup.Phase === 'failed') renderStartupError();
+        else clearStarting();
+      }, function () {
+        if (generation === playGeneration && !startupFailed) clearStarting();
+      });
     }, 250);
   }
 
@@ -1029,6 +1070,7 @@ pub static JS: &str = r#"
     if (!target || !target.closest) return;
 
     if (target.closest('.btnPlay, .btnReplay')) {
+      clearStartupFailure(window.ApiClient);
       removeStartupStatus();
       document.documentElement.classList.add(STARTING_CLASS);
       playStartedAt = performance.now();
@@ -1073,6 +1115,7 @@ pub static JS: &str = r#"
     if (apiClient && typeof apiClient.sendPlayStateCommand === 'function') {
       apiClient.sendPlayStateCommand(apiClient.deviceId(), 'Stop').catch(function () {});
     }
+    clearStartupFailure(apiClient);
     clearStarting();
     setTimeout(function () {
       if (button) button.click();
@@ -1180,6 +1223,10 @@ mod tests {
     #[test]
     fn failed_playback_replaces_the_placeholder_video_with_an_actionable_error() {
         assert!(JS.contains("pathname === '/videos/no-streams'"));
+        assert!(JS.contains("startup.Phase === 'failed'"));
+        assert!(JS.contains("method: 'DELETE'"));
+        assert!(JS.contains("clearStartupFailure(window.ApiClient);"));
+        assert!(JS.contains("stopEncodingWhenAvailable("));
         assert!(JS.contains("Unable to start video"));
         assert!(JS.contains("Remux tried the available sources"));
         assert!(JS.contains("className = 'remux-startup-back'"));

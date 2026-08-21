@@ -17,7 +17,7 @@ use axum_anyhow::ApiResult as Result;
 use axum_extra::extract::Query;
 use futures_util::StreamExt;
 use http::{Response, StatusCode, header};
-use remux_macros::get;
+use remux_macros::{delete, get};
 use serde::Serialize;
 use tokio_util::io::ReaderStream;
 use tracing::{debug, error, info, trace, warn};
@@ -450,26 +450,70 @@ pub async fn playback_startup_status(
             &session
                 .device
                 .id,
-        )
-        .context_not_found("playback startup not found")?;
-    if progress.user_id
-        != session
-            .user
-            .id
+        );
+    if progress
+        .as_ref()
+        .is_some_and(|progress| {
+            progress.user_id
+                != session
+                    .user
+                    .id
+        })
     {
         return Err(anyhow::anyhow!("playback startup not found")
             .context_not_found("playback startup not found"));
     }
-
-    let prebuffer = auto_prebuffer_plan(&state, &progress.play_session_id)
-        .map(|plan| PrebufferStatusResponse::from_plan(&plan));
-    let response = PlaybackStartupStatusResponse {
-        phase: startup_phase(&progress, prebuffer.is_some()),
-        elapsed_milliseconds: duration_milliseconds(progress.elapsed),
-        prebuffer,
+    let has_failure = state
+        .ctx
+        .sessions
+        .has_recent_startup_failure(
+            &session
+                .device
+                .id,
+            session
+                .user
+                .id,
+        );
+    let response = if has_failure
+        && !progress
+            .as_ref()
+            .is_some_and(|progress| progress.first_segment_served)
+    {
+        PlaybackStartupStatusResponse {
+            phase: "failed",
+            elapsed_milliseconds: 0,
+            prebuffer: None,
+        }
+    } else if let Some(progress) = progress {
+        let prebuffer = auto_prebuffer_plan(&state, &progress.play_session_id)
+            .map(|plan| PrebufferStatusResponse::from_plan(&plan));
+        PlaybackStartupStatusResponse {
+            phase: startup_phase(&progress, prebuffer.is_some()),
+            elapsed_milliseconds: duration_milliseconds(progress.elapsed),
+            prebuffer,
+        }
+    } else {
+        return Err(anyhow::anyhow!("playback startup not found")
+            .context_not_found("playback startup not found"));
     };
 
     Ok(([(header::CACHE_CONTROL, "no-store")], Json(response)))
+}
+
+#[delete("/remux/playback/startup")]
+pub async fn clear_playback_startup_failure(
+    State(state): State<AppState>,
+    session: auth::AuthSession,
+) -> Result<impl IntoResponse> {
+    state
+        .ctx
+        .sessions
+        .clear_startup_failure(
+            &session
+                .device
+                .id,
+        );
+    Ok(StatusCode::NO_CONTENT)
 }
 
 fn retain_prebuffer_candidate(
@@ -4368,6 +4412,118 @@ mod tests {
         assert_eq!(super::startup_phase(&progress, true), "preparing_video");
         progress.first_segment_served = true;
         assert_eq!(super::startup_phase(&progress, true), "starting_playback");
+    }
+
+    #[tokio::test]
+    async fn startup_status_reports_a_terminal_failure() {
+        let (server, guard, token) =
+            crate::integration_test::authenticated_server().await;
+        let user = crate::db::User::get_by_username(
+            &guard
+                .0
+                .db,
+            "test",
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let item_id = uuid::Uuid::new_v4();
+        guard
+            .0
+            .sessions
+            .begin_startup("failed-session", item_id, user.id, "test-device", "Test");
+        guard
+            .0
+            .sessions
+            .fail_startup("failed-session", "no playable source")
+            .unwrap();
+        guard
+            .0
+            .sessions
+            .begin_startup("automatic-retry", item_id, user.id, "test-device", "Test");
+
+        let response = server
+            .get("/remux/playback/startup")
+            .add_header(
+                http::header::AUTHORIZATION,
+                http::HeaderValue::from_str(
+                    &crate::integration_test::auth_header_with_token(&token),
+                )
+                .unwrap(),
+            )
+            .await;
+
+        response.assert_status_ok();
+        assert_eq!(response.json::<serde_json::Value>()["Phase"], "failed");
+
+        guard
+            .0
+            .sessions
+            .mark_first_segment_served("automatic-retry");
+        let response = server
+            .get("/remux/playback/startup")
+            .add_header(
+                http::header::AUTHORIZATION,
+                http::HeaderValue::from_str(
+                    &crate::integration_test::auth_header_with_token(&token),
+                )
+                .unwrap(),
+            )
+            .await;
+        response.assert_status_ok();
+        assert_eq!(
+            response.json::<serde_json::Value>()["Phase"],
+            "starting_playback"
+        );
+    }
+
+    #[tokio::test]
+    async fn startup_failure_can_be_acknowledged_by_the_client() {
+        let (server, guard, token) =
+            crate::integration_test::authenticated_server().await;
+        let user = crate::db::User::get_by_username(
+            &guard
+                .0
+                .db,
+            "test",
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        guard
+            .0
+            .sessions
+            .begin_startup(
+                "failed-session",
+                uuid::Uuid::new_v4(),
+                user.id,
+                "test-device",
+                "Test",
+            );
+        guard
+            .0
+            .sessions
+            .fail_startup("failed-session", "no playable source")
+            .unwrap();
+
+        let response = server
+            .delete("/remux/playback/startup")
+            .add_header(
+                http::header::AUTHORIZATION,
+                http::HeaderValue::from_str(
+                    &crate::integration_test::auth_header_with_token(&token),
+                )
+                .unwrap(),
+            )
+            .await;
+
+        response.assert_status(http::StatusCode::NO_CONTENT);
+        assert!(
+            !guard
+                .0
+                .sessions
+                .has_recent_startup_failure("test-device", user.id)
+        );
     }
 
     #[test]

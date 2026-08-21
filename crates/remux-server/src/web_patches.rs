@@ -38,10 +38,10 @@ pub static CSS: &str = r##"
   }
 
   .remux-startup-status {
-    position: absolute;
+    position: fixed;
     left: 50%;
     bottom: 12%;
-    z-index: 2;
+    z-index: 1002;
     box-sizing: border-box;
     width: calc(100% - 4em);
     max-width: 36em;
@@ -81,6 +81,25 @@ pub static CSS: &str = r##"
   .remux-startup-progress-bar.remux-indeterminate {
     width: 35%;
     animation: remux-progress-slide 1.3s ease-in-out infinite;
+  }
+  .remux-startup-status.remux-startup-error {
+    bottom: 50%;
+    transform: translate(-50%, 50%);
+    pointer-events: auto;
+  }
+  .remux-startup-error .remux-startup-progress {
+    display: none;
+  }
+  .remux-startup-back {
+    min-width: 8em;
+    margin-top: 1em;
+    padding: 0.65em 1.2em;
+    border: 0;
+    border-radius: 0.3em;
+    background: #00a4dc;
+    color: #fff;
+    font: inherit;
+    cursor: pointer;
   }
   @keyframes remux-progress-slide {
     from { transform: translateX(-110%); }
@@ -704,6 +723,9 @@ pub static JS: &str = r#"
   var playGeneration = 0;
   var statusTimer = null;
   var selectedSourceLabel = '';
+  var sawStartupStatus = false;
+  var startupUnavailableCount = 0;
+  var startupFailed = false;
 
   var PHASE_LABELS = {
     preparing_playback: 'Preparing playback',
@@ -727,6 +749,7 @@ pub static JS: &str = r#"
   function clearStarting() {
     document.documentElement.classList.remove(STARTING_CLASS);
     removeStartupStatus();
+    startupFailed = false;
   }
 
   function selectedSource() {
@@ -739,11 +762,14 @@ pub static JS: &str = r#"
     return '';
   }
 
-  function ensureStartupStatus() {
+  function ensureStartupStatus(allowWithoutPlayer) {
     var container = document.querySelector('.videoPlayerContainer-onTop');
-    if (!container) return null;
-    var status = container.querySelector('.remux-startup-status');
-    if (status) return status;
+    var status = document.querySelector('.remux-startup-status');
+    if (!container && !allowWithoutPlayer) return null;
+    if (status) {
+      if (container && status.parentNode !== container) container.appendChild(status);
+      return status;
+    }
 
     status = document.createElement('div');
     status.className = 'remux-startup-status';
@@ -754,7 +780,7 @@ pub static JS: &str = r#"
         '<div class="remux-startup-progress-bar remux-indeterminate"></div>' +
       '</div>' +
       '<div class="remux-startup-footnote"></div>';
-    container.appendChild(status);
+    (container || document.body).appendChild(status);
     return status;
   }
 
@@ -783,8 +809,12 @@ pub static JS: &str = r#"
   }
 
   function renderStartupStatus(startup) {
-    var status = ensureStartupStatus();
+    var status = ensureStartupStatus(false);
     if (!status) return;
+
+    status.classList.remove('remux-startup-error');
+    var oldBack = status.querySelector('.remux-startup-back');
+    if (oldBack && oldBack.parentNode) oldBack.parentNode.removeChild(oldBack);
 
     var phase = startup && startup.Phase || 'preparing_playback';
     var elapsed = startup && startup.ElapsedMilliseconds;
@@ -840,8 +870,54 @@ pub static JS: &str = r#"
     }
   }
 
+  function urlIsNoStreams(value) {
+    if (!value) return false;
+    try {
+      return new URL(String(value), location.href).pathname === '/videos/no-streams';
+    } catch (error) {
+      return false;
+    }
+  }
+
+  function isNoStreamsPlayback(video) {
+    if (video && (urlIsNoStreams(video.currentSrc) || urlIsNoStreams(video.getAttribute('src')))) {
+      return true;
+    }
+    if (!window.performance || !performance.getEntriesByType) return false;
+    var entries = performance.getEntriesByType('resource');
+    for (var i = entries.length - 1; i >= 0; i--) {
+      if (entries[i].startTime < playStartedAt - 1000) break;
+      if (urlIsNoStreams(entries[i].name)) return true;
+    }
+    return false;
+  }
+
+  function renderStartupError() {
+    if (!document.documentElement.classList.contains(STARTING_CLASS)) return;
+    if (statusTimer !== null) {
+      clearTimeout(statusTimer);
+      statusTimer = null;
+    }
+    startupFailed = true;
+    var status = ensureStartupStatus(true);
+    if (!status) return;
+    status.classList.add('remux-startup-error');
+    status.querySelector('.remux-startup-title').textContent = 'Unable to start video';
+    status.querySelector('.remux-startup-detail').textContent =
+      'Remux tried the available sources, but none became playable.';
+    status.querySelector('.remux-startup-footnote').textContent =
+      'Go back to choose another version or try again.';
+    if (!status.querySelector('.remux-startup-back')) {
+      var back = document.createElement('button');
+      back.type = 'button';
+      back.className = 'remux-startup-back';
+      back.textContent = 'Back';
+      status.appendChild(back);
+    }
+  }
+
   function currentPlaySessionId(startedAt) {
-    var video = document.querySelector('.videoPlayerContainer-onTop video');
+    var video = document.querySelector('video');
     if (video) {
       try {
         var videoId = new URL(
@@ -885,6 +961,7 @@ pub static JS: &str = r#"
 
   function pollStartupStatus(generation) {
     if (generation !== playGeneration
+        || startupFailed
         || !document.documentElement.classList.contains(STARTING_CLASS)) return;
 
     // Render the fallback only once. Replacing the last server-reported phase
@@ -909,21 +986,39 @@ pub static JS: &str = r#"
     }).then(function (startup) {
       if (generation !== playGeneration
           || !document.documentElement.classList.contains(STARTING_CLASS)) return;
+      sawStartupStatus = true;
+      startupUnavailableCount = 0;
       renderStartupStatus(startup);
       scheduleStartupStatus(generation, 500);
     }, function () {
       if (generation === playGeneration
           && document.documentElement.classList.contains(STARTING_CLASS)) {
-        scheduleStartupStatus(generation, 500);
+        startupUnavailableCount += 1;
+        var video = document.querySelector('video');
+        if (isNoStreamsPlayback(video)
+            || (sawStartupStatus && startupUnavailableCount >= 2
+                && (!video || video.paused || video.readyState < 2))) {
+          renderStartupError();
+        } else {
+          scheduleStartupStatus(generation, 500);
+        }
       }
     });
   }
 
   function clearWhenPlaybackChanges(event) {
     var target = event.target;
-    if (target && target.matches && target.matches('.videoPlayerContainer-onTop video')) {
+    if (!target || !target.matches || !target.matches('video')) return;
+    if (event.type === 'emptied') {
       clearStarting();
+      return;
     }
+    var generation = playGeneration;
+    setTimeout(function () {
+      if (generation !== playGeneration || startupFailed) return;
+      if (isNoStreamsPlayback(target)) renderStartupError();
+      else clearStarting();
+    }, 250);
   }
 
   document.addEventListener('playing', clearWhenPlaybackChanges, true);
@@ -939,16 +1034,29 @@ pub static JS: &str = r#"
       playStartedAt = performance.now();
       playGeneration += 1;
       selectedSourceLabel = selectedSource();
+      sawStartupStatus = false;
+      startupUnavailableCount = 0;
+      startupFailed = false;
       scheduleStartupStatus(playGeneration, 0);
       return;
     }
 
-    if (!document.documentElement.classList.contains(STARTING_CLASS)
-        || !target.closest('.headerBackButton')) return;
+    if (!document.documentElement.classList.contains(STARTING_CLASS)) return;
+    var errorBack = target.closest('.remux-startup-back');
+    var button = target.closest('.headerBackButton');
+    if (errorBack) {
+      var buttons = document.querySelectorAll('.headerBackButton');
+      for (var i = 0; i < buttons.length; i++) {
+        if (buttons[i].offsetParent !== null) {
+          button = buttons[i];
+          break;
+        }
+      }
+    }
+    if (!button && !errorBack) return;
 
     event.preventDefault();
     event.stopImmediatePropagation();
-    var button = target.closest('.headerBackButton');
     var playerContainer = document.querySelector('.videoPlayerContainer-onTop');
     if (playerContainer) playerContainer.classList.remove('videoPlayerContainer-onTop');
     var video = playerContainer && playerContainer.querySelector('video');
@@ -966,7 +1074,10 @@ pub static JS: &str = r#"
       apiClient.sendPlayStateCommand(apiClient.deviceId(), 'Stop').catch(function () {});
     }
     clearStarting();
-    setTimeout(function () { button.click(); }, 0);
+    setTimeout(function () {
+      if (button) button.click();
+      else history.back();
+    }, 0);
   }, true);
 }());
 
@@ -1064,5 +1175,24 @@ mod tests {
     #[test]
     fn startup_status_keeps_the_last_phase_between_polls() {
         assert!(JS.contains("if (!document.querySelector('.remux-startup-status'))"));
+    }
+
+    #[test]
+    fn failed_playback_replaces_the_placeholder_video_with_an_actionable_error() {
+        assert!(JS.contains("pathname === '/videos/no-streams'"));
+        assert!(JS.contains("Unable to start video"));
+        assert!(JS.contains("Remux tried the available sources"));
+        assert!(JS.contains("className = 'remux-startup-back'"));
+        assert!(JS.contains("(container || document.body).appendChild(status);"));
+        assert!(CSS.contains("position: fixed"));
+        assert!(CSS.contains(".remux-startup-status.remux-startup-error"));
+        assert!(CSS.contains("pointer-events: auto"));
+    }
+
+    #[test]
+    fn startup_progress_waits_for_the_player_view() {
+        assert!(JS.contains("if (!container && !allowWithoutPlayer) return null;"));
+        assert!(JS.contains("var status = ensureStartupStatus(false);"));
+        assert!(JS.contains("var status = ensureStartupStatus(true);"));
     }
 }

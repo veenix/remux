@@ -84,6 +84,8 @@ const PREBUFFER_MIN_MEDIA_RUNWAY: Duration = Duration::from_secs(60);
 const PREBUFFER_RATE_GRACE: Duration = Duration::from_secs(3);
 const PREBUFFER_RATE_SAMPLE: Duration = Duration::from_secs(15);
 const PREBUFFER_THROUGHPUT_SAFETY: f64 = 0.90;
+const PREBUFFER_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+const PREBUFFER_MAX_WAIT: Duration = Duration::from_secs(15 * 60);
 const PREBUFFER_LOG_INTERVAL: Duration = Duration::from_secs(30);
 const PREBUFFER_PLAN_TTL: Duration = Duration::from_secs(6 * 60 * 60);
 
@@ -362,6 +364,13 @@ impl StartupProbeResult {
         self.is_strong() || self.is_viable()
     }
 
+    fn can_start_without_prebuffer(&self) -> bool {
+        self.is_decisive()
+            && self
+                .cold_headroom()
+                .is_some_and(|headroom| headroom >= HEDGE_VIABLE_HEADROOM)
+    }
+
     fn is_stalled(&self) -> bool {
         self.bytes < HEDGE_MIN_SAMPLE_BYTES
     }
@@ -509,6 +518,13 @@ impl AutoPrebufferOwnership {
     fn hand_off(&mut self) {
         self.handed_off = true;
     }
+
+    async fn release(mut self) {
+        self.handed_off = true;
+        self.torrent
+            .release_playback(&self.play_session_id)
+            .await;
+    }
 }
 
 impl Drop for AutoPrebufferOwnership {
@@ -575,120 +591,161 @@ async fn prebuffer_auto_source(
     // prebuffering fails or is cancelled, release that provisional claim. On
     // success, transfer it to the HLS input request that follows immediately.
     let mut ownership = AutoPrebufferOwnership::new(state, play_session_id);
-    let response = STARTUP_HEDGE_CLIENT
-        .get(&url)
-        .header(http::header::RANGE, format!("bytes={next_offset}-"))
-        .send()
-        .await?
-        .error_for_status()?;
-    anyhow::ensure!(
-        response.status() == StatusCode::PARTIAL_CONTENT,
-        "Auto prebuffer server ignored byte range at offset {next_offset}"
-    );
-    if let Some(actual_size) = response_total_size(response.headers()) {
-        anyhow::ensure!(
-            actual_size == plan.source_size_bytes,
-            "Auto prebuffer source size changed from {} to {} bytes",
-            plan.source_size_bytes,
-            actual_size
-        );
-    }
-
-    let request_started = Instant::now();
-    let mut rate_window_started = request_started + PREBUFFER_RATE_GRACE;
-    let mut rate_window_bytes = 0u64;
-    let mut last_log = Instant::now();
-    let mut stream = response.bytes_stream();
-    while let Some(chunk) = stream
-        .next()
+    let outcome: anyhow::Result<()> = async {
+        let response = tokio::time::timeout(
+            PREBUFFER_IDLE_TIMEOUT,
+            STARTUP_HEDGE_CLIENT
+                .get(&url)
+                .header(http::header::RANGE, format!("bytes={next_offset}-"))
+                .send(),
+        )
         .await
-    {
-        let chunk = chunk?;
-        let accepted = (chunk.len() as u64).min(
-            plan.source_size_bytes
-                .saturating_sub(next_offset),
+        .map_err(|_| anyhow::anyhow!("Auto prebuffer timed out opening the source"))??
+        .error_for_status()?;
+        anyhow::ensure!(
+            response.status() == StatusCode::PARTIAL_CONTENT,
+            "Auto prebuffer server ignored byte range at offset {next_offset}"
         );
-        if accepted == 0 {
-            break;
+        if let Some(actual_size) = response_total_size(response.headers()) {
+            anyhow::ensure!(
+                actual_size == plan.source_size_bytes,
+                "Auto prebuffer source size changed from {} to {} bytes",
+                plan.source_size_bytes,
+                actual_size
+            );
         }
-        next_offset = next_offset.saturating_add(accepted);
-        plan.next_offset
-            .store(next_offset, Ordering::Relaxed);
 
-        let now = Instant::now();
-        if now >= rate_window_started {
-            rate_window_bytes = rate_window_bytes.saturating_add(accepted);
-            let sample_elapsed = now.saturating_duration_since(rate_window_started);
-            if sample_elapsed >= PREBUFFER_RATE_SAMPLE {
-                let observed_bps = rate_window_bytes as f64 * 8.0
-                    / sample_elapsed
-                        .as_secs_f64()
-                        .max(0.001);
-                let estimate = if plan
+        let request_started = Instant::now();
+        let mut rate_window_started = request_started + PREBUFFER_RATE_GRACE;
+        let mut rate_window_bytes = 0u64;
+        let mut last_log = Instant::now();
+        let mut stream = response.bytes_stream();
+        loop {
+            let remaining =
+                PREBUFFER_MAX_WAIT.saturating_sub(request_started.elapsed());
+            anyhow::ensure!(
+                !remaining.is_zero(),
+                "Auto prebuffer exceeded {} seconds",
+                PREBUFFER_MAX_WAIT.as_secs()
+            );
+            let wait = PREBUFFER_IDLE_TIMEOUT.min(remaining);
+            let next = match tokio::time::timeout(wait, stream.next()).await {
+                Ok(next) => next,
+                Err(_) if remaining <= PREBUFFER_IDLE_TIMEOUT => {
+                    anyhow::bail!(
+                        "Auto prebuffer exceeded {} seconds",
+                        PREBUFFER_MAX_WAIT.as_secs()
+                    )
+                }
+                Err(_) => {
+                    anyhow::bail!(
+                        "Auto prebuffer received no data for {} seconds",
+                        PREBUFFER_IDLE_TIMEOUT.as_secs()
+                    )
+                }
+            };
+            let Some(chunk) = next else {
+                break;
+            };
+            let chunk = chunk?;
+            let accepted = (chunk.len() as u64).min(
+                plan.source_size_bytes
+                    .saturating_sub(next_offset),
+            );
+            if accepted == 0 {
+                break;
+            }
+            next_offset = next_offset.saturating_add(accepted);
+            plan.next_offset
+                .store(next_offset, Ordering::Relaxed);
+
+            let now = Instant::now();
+            if now >= rate_window_started {
+                rate_window_bytes = rate_window_bytes.saturating_add(accepted);
+                let sample_elapsed = now.saturating_duration_since(rate_window_started);
+                if sample_elapsed >= PREBUFFER_RATE_SAMPLE {
+                    let observed_bps = rate_window_bytes as f64 * 8.0
+                        / sample_elapsed
+                            .as_secs_f64()
+                            .max(0.001);
+                    let estimate = if plan
+                        .rate_trusted
+                        .load(Ordering::Relaxed)
+                    {
+                        plan.estimated_goodput_bps() * 0.70 + observed_bps * 0.30
+                    } else {
+                        observed_bps
+                    };
+                    plan.estimated_goodput_bps
+                        .store(estimate.to_bits(), Ordering::Relaxed);
+                    plan.rate_trusted
+                        .store(true, Ordering::Relaxed);
+                    rate_window_started = now;
+                    rate_window_bytes = 0;
+                }
+            }
+
+            let downloaded_bytes = plan.downloaded_bytes();
+            let target_bytes = plan.target_bytes();
+            if last_log.elapsed() >= PREBUFFER_LOG_INTERVAL {
+                let estimated_bps = plan.estimated_goodput_bps();
+                let remaining_to_target = target_bytes.saturating_sub(downloaded_bytes);
+                let estimated_wait_seconds = (estimated_bps > 0.0)
+                    .then(|| remaining_to_target as f64 * 8.0 / estimated_bps);
+                info!(
+                    %play_session_id,
+                    source_id = %media.id,
+                    downloaded_bytes,
+                    target_bytes,
+                    source_bytes = plan.remaining_bytes(),
+                    estimated_goodput_mbps = estimated_bps / 1_000_000.0,
+                    required_mbps = plan.required_bitrate_bps / 1_000_000.0,
+                    estimated_wait_seconds,
+                    rate_trusted = plan.rate_trusted.load(Ordering::Relaxed),
+                    "Auto prebuffer progress"
+                );
+                last_log = now;
+            }
+
+            if downloaded_bytes >= plan.remaining_bytes()
+                || (plan
                     .rate_trusted
                     .load(Ordering::Relaxed)
-                {
-                    plan.estimated_goodput_bps() * 0.70 + observed_bps * 0.30
-                } else {
-                    observed_bps
-                };
-                plan.estimated_goodput_bps
-                    .store(estimate.to_bits(), Ordering::Relaxed);
-                plan.rate_trusted
-                    .store(true, Ordering::Relaxed);
-                rate_window_started = now;
-                rate_window_bytes = 0;
+                    && downloaded_bytes >= target_bytes)
+            {
+                info!(
+                    %play_session_id,
+                    source_id = %media.id,
+                    downloaded_bytes,
+                    target_bytes,
+                    source_bytes = plan.remaining_bytes(),
+                    estimated_goodput_mbps = plan.estimated_goodput_bps() / 1_000_000.0,
+                    required_mbps = plan.required_bitrate_bps / 1_000_000.0,
+                    "Auto prebuffer reached safe playback runway"
+                );
+                return Ok(());
             }
         }
 
-        let downloaded_bytes = plan.downloaded_bytes();
-        let target_bytes = plan.target_bytes();
-        if last_log.elapsed() >= PREBUFFER_LOG_INTERVAL {
-            let estimated_bps = plan.estimated_goodput_bps();
-            let remaining_to_target = target_bytes.saturating_sub(downloaded_bytes);
-            let estimated_wait_seconds = (estimated_bps > 0.0)
-                .then(|| remaining_to_target as f64 * 8.0 / estimated_bps);
-            info!(
-                %play_session_id,
-                source_id = %media.id,
-                downloaded_bytes,
-                target_bytes,
-                source_bytes = plan.remaining_bytes(),
-                estimated_goodput_mbps = estimated_bps / 1_000_000.0,
-                required_mbps = plan.required_bitrate_bps / 1_000_000.0,
-                estimated_wait_seconds,
-                rate_trusted = plan.rate_trusted.load(Ordering::Relaxed),
-                "Auto prebuffer progress"
-            );
-            last_log = now;
-        }
-
-        if downloaded_bytes >= plan.remaining_bytes()
-            || (plan
-                .rate_trusted
-                .load(Ordering::Relaxed)
-                && downloaded_bytes >= target_bytes)
-        {
-            info!(
-                %play_session_id,
-                source_id = %media.id,
-                downloaded_bytes,
-                target_bytes,
-                source_bytes = plan.remaining_bytes(),
-                estimated_goodput_mbps = plan.estimated_goodput_bps() / 1_000_000.0,
-                required_mbps = plan.required_bitrate_bps / 1_000_000.0,
-                "Auto prebuffer reached safe playback runway"
-            );
+        anyhow::bail!(
+            "Auto prebuffer ended after {} of {} bytes",
+            plan.downloaded_bytes(),
+            plan.target_bytes()
+        )
+    }
+    .await;
+    match outcome {
+        Ok(()) => {
             ownership.hand_off();
-            return Ok(());
+            Ok(())
+        }
+        Err(error) => {
+            ownership
+                .release()
+                .await;
+            Err(error)
         }
     }
-
-    anyhow::bail!(
-        "Auto prebuffer ended after {} of {} bytes",
-        plan.downloaded_bytes(),
-        plan.target_bytes()
-    )
 }
 
 fn average_bitrate_bps(size_bytes: i64, duration_seconds: f64) -> Option<f64> {
@@ -981,6 +1038,7 @@ fn log_startup_probe(role: &str, result: &StartupProbeResult) {
         deficit_runway_secs = result.deficit_runway().map(|runway| runway.as_secs_f64()),
         strong = result.is_strong(),
         viable = result.is_viable(),
+        ready_without_prebuffer = result.can_start_without_prebuffer(),
         stalled = result.is_stalled(),
         error = ?result.error,
         "Auto startup hedge probe"
@@ -1033,12 +1091,12 @@ async fn probe_patient_candidates(
         let Some((candidate, result)) = next else {
             break;
         };
-        let decisive = result.is_decisive();
+        let ready_without_prebuffer = result.can_start_without_prebuffer();
         if selection_deadline.is_none() && can_prebuffer_probe(&result) {
             selection_deadline = Some(Instant::now() + PATIENT_SELECTION_GRACE);
         }
         results.push((candidate, result));
-        if decisive {
+        if ready_without_prebuffer {
             break;
         }
     }
@@ -1755,14 +1813,59 @@ async fn maybe_hedge_auto_startup(
             .collect::<Vec<_>>();
         let no_remaining = VecDeque::new();
         let selected = finalize_selection(selected, standbys, &no_remaining);
-        if result.is_decisive() {
+        // A warm burst after a long peer-discovery stall can look fast while
+        // the full cold-start sample is still slower than playback. Keep that
+        // source, but build a measured runway before handing it to FFmpeg.
+        if result.can_start_without_prebuffer() {
             return Ok(selected);
         }
         let plan = save_auto_prebuffer_plan(state, play_session_id, &result)
             .ok_or_else(|| {
                 anyhow::anyhow!("could not construct Auto prebuffer plan")
             })?;
-        prebuffer_auto_source(state, play_session_id, &selected, plan).await?;
+        if let Err(error) =
+            prebuffer_auto_source(state, play_session_id, &selected, plan).await
+        {
+            clear_auto_prebuffer_plan(state, play_session_id);
+            warn!(
+                %play_session_id,
+                source_id = %selected.id,
+                source_title = %selected.title,
+                %error,
+                "Auto prebuffer stalled; advancing to another candidate"
+            );
+            mark_failed(&selected);
+            StreamService::clear_auto_session_winner(
+                &state
+                    .ctx
+                    .store,
+                play_session_id,
+            );
+            let replacement = StreamService::resolve_auto(
+                &state.ctx,
+                choice.item_id,
+                &choice.resolution,
+                choice.user_id,
+            )
+            .await?;
+            StreamService::pin_auto_session_winner(
+                &state
+                    .ctx
+                    .store,
+                play_session_id,
+                choice.item_id,
+                StreamService::auto_source_id(choice.item_id, &choice.resolution),
+                replacement.id,
+                choice.user_id,
+            );
+            return Box::pin(maybe_hedge_auto_startup(
+                state,
+                play_session_id,
+                replacement,
+                start_time_ticks,
+            ))
+            .await;
+        }
         clear_auto_prebuffer_plan(state, play_session_id);
         return Ok(selected);
     }
@@ -4267,6 +4370,25 @@ mod tests {
         assert!(slow_setup.cold_goodput_bps() < 1_000_000.0);
         assert!(!super::prefer_backup_probe(&quick_but_slow, &slow_setup));
         assert!(super::prefer_patient_probe(&quick_but_slow, &slow_setup));
+    }
+
+    #[test]
+    fn patient_probe_prebuffers_a_fast_burst_after_a_slow_cold_start() {
+        let mut probe = startup_probe(1.0, Some(2.229));
+        probe.bytes = super::PATIENT_PROBE_BYTES;
+        probe.elapsed = Duration::from_millis(18_577);
+        probe.warmup_elapsed = Some(Duration::from_millis(17_646));
+        probe.source_size_bytes = Some(1_839_000_000);
+
+        assert!(probe.goodput_bps() > 17_000_000.0);
+        assert!(probe.is_decisive());
+        assert!(
+            probe
+                .cold_headroom()
+                .is_some_and(|headroom| headroom < 1.0)
+        );
+        assert!(!probe.can_start_without_prebuffer());
+        assert!(super::AutoPrebufferPlan::from_probe(&probe).is_some());
     }
 
     #[test]

@@ -680,7 +680,7 @@ fn default_torrent_max_storage_gb() -> Option<u64> {
 }
 
 fn default_torrent_keep_days() -> Option<u32> {
-    Some(2)
+    Some(7)
 }
 
 fn default_torrent_min_free_gb() -> Option<u64> {
@@ -688,7 +688,7 @@ fn default_torrent_min_free_gb() -> Option<u64> {
 }
 
 fn default_torrent_keep_count() -> Option<usize> {
-    Some(3)
+    Some(5)
 }
 
 impl Config {

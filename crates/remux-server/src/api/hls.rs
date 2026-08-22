@@ -2741,6 +2741,10 @@ async fn create_hls_session_inner(
                 hw => Some(hw.to_string()),
             }
         };
+        let source_is_p2p = resolved_media
+            .stream_info
+            .as_ref()
+            .is_some_and(|info| info.is_p2p());
         let session = TranscodeSession::new(
             play_session_id.clone(),
             id,
@@ -2760,6 +2764,7 @@ async fn create_hls_session_inner(
                 .unwrap_or_default(),
             runtime_ticks,
             is_live,
+            source_is_p2p,
             source_video_codec,
             source_audio_codec,
             source_video_profile,
@@ -3371,12 +3376,14 @@ fn slow_auto_observation_window(segment_length: u32) -> std::time::Duration {
 }
 
 fn slow_auto_startup_ratio(
+    startup_in_progress: bool,
     elapsed: std::time::Duration,
     segment_length: u32,
     current_idx: Option<u32>,
     requested_idx: u32,
 ) -> Option<f64> {
-    if segment_length == 0
+    if !startup_in_progress
+        || segment_length == 0
         || current_idx.is_some_and(|current| requested_idx <= current)
         || elapsed > std::time::Duration::from_secs(2 * 60)
     {
@@ -3482,9 +3489,16 @@ async fn maybe_switch_slow_auto_source(
     {
         return AutoSourceSwitch::NotNeeded;
     }
-    let Some(production_ratio) =
-        slow_auto_startup_ratio(elapsed, segment_length, current_idx, requested_idx)
-    else {
+    let Some(production_ratio) = slow_auto_startup_ratio(
+        state
+            .ctx
+            .sessions
+            .has_startup(play_session_id),
+        elapsed,
+        segment_length,
+        current_idx,
+        requested_idx,
+    ) else {
         return AutoSourceSwitch::NotNeeded;
     };
 
@@ -3709,6 +3723,10 @@ async fn maybe_switch_slow_auto_source(
     }
     let latest_idx = get_current_transcoding_index(&output_dir);
     if slow_auto_startup_ratio(
+        state
+            .ctx
+            .sessions
+            .has_startup(play_session_id),
         latest_elapsed,
         segment_length,
         latest_idx,
@@ -4884,23 +4902,34 @@ mod tests {
     #[test]
     fn slow_auto_startup_requires_enough_observation_time() {
         assert_eq!(
-            super::slow_auto_startup_ratio(Duration::from_secs(11), 6, Some(0), 1,),
+            super::slow_auto_startup_ratio(
+                true,
+                Duration::from_secs(11),
+                6,
+                Some(0),
+                1,
+            ),
             None
         );
     }
 
     #[test]
     fn slow_auto_startup_detects_unsustainable_segment_production() {
-        let ratio =
-            super::slow_auto_startup_ratio(Duration::from_secs(36), 6, Some(0), 1)
-                .expect("one segment in 36 seconds is too slow");
+        let ratio = super::slow_auto_startup_ratio(
+            true,
+            Duration::from_secs(36),
+            6,
+            Some(0),
+            1,
+        )
+        .expect("one segment in 36 seconds is too slow");
         assert!((ratio - (1.0 / 6.0)).abs() < f64::EPSILON);
     }
 
     #[test]
     fn slow_auto_startup_detects_no_initial_progress() {
         assert_eq!(
-            super::slow_auto_startup_ratio(Duration::from_secs(18), 6, None, 0,),
+            super::slow_auto_startup_ratio(true, Duration::from_secs(18), 6, None, 0,),
             Some(0.0)
         );
     }
@@ -4920,7 +4949,13 @@ mod tests {
     #[test]
     fn slow_auto_startup_accepts_real_time_production() {
         assert_eq!(
-            super::slow_auto_startup_ratio(Duration::from_secs(24), 6, Some(3), 4,),
+            super::slow_auto_startup_ratio(
+                true,
+                Duration::from_secs(24),
+                6,
+                Some(3),
+                4,
+            ),
             None
         );
     }
@@ -4928,7 +4963,23 @@ mod tests {
     #[test]
     fn slow_auto_startup_only_applies_to_early_playback() {
         assert_eq!(
-            super::slow_auto_startup_ratio(Duration::from_secs(121), 6, Some(4), 5,),
+            super::slow_auto_startup_ratio(
+                true,
+                Duration::from_secs(121),
+                6,
+                Some(4),
+                5,
+            ),
+            None
+        );
+        assert_eq!(
+            super::slow_auto_startup_ratio(
+                false,
+                Duration::from_secs(24),
+                6,
+                Some(0),
+                1,
+            ),
             None
         );
     }

@@ -1,7 +1,10 @@
 use remux_sdks::remux::TranscodeReasons;
 use std::{
     path::PathBuf,
-    sync::{Arc, atomic::AtomicU32},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicU32},
+    },
     time::Instant,
 };
 use tokio::sync::{Notify, watch};
@@ -41,6 +44,12 @@ pub struct TranscodeSession {
     pub start_time_secs: u32,
     /// Playback offset in seconds relative to start_time_secs, updated from progress reports.
     pub playback_offset_secs: Arc<AtomicU32>,
+    /// Whether the client explicitly reports paused playback. Paused sessions
+    /// remain active and may keep extending their download buffer.
+    pub playback_paused: Arc<AtomicBool>,
+    /// Whether the transcode reads from the torrent engine. Torrent sessions
+    /// can retain downloaded pieces and keep filling their buffer while paused.
+    pub source_is_p2p: bool,
     /// Total runtime of the media in Jellyfin ticks (100-ns units).
     pub runtime_ticks: i64,
     /// True for live TV — variant playlist is served from the ffmpeg-written EVENT file.
@@ -85,6 +94,7 @@ impl TranscodeSession {
         transcode_reasons: TranscodeReasons,
         runtime_ticks: i64,
         is_live: bool,
+        source_is_p2p: bool,
         source_video_codec: Option<String>,
         source_audio_codec: Option<String>,
         source_video_profile: Option<String>,
@@ -119,6 +129,8 @@ impl TranscodeSession {
             last_segment_index: Arc::new(AtomicU32::new(0)),
             start_time_secs: 0,
             playback_offset_secs: Arc::new(AtomicU32::new(0)),
+            playback_paused: Arc::new(AtomicBool::new(false)),
+            source_is_p2p,
             runtime_ticks,
             is_live,
             source_video_codec,

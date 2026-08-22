@@ -85,31 +85,80 @@ pub async fn items_playbackinfo_get(
     items_playbackinfo_inner(state, session, id, q).await
 }
 
-/// Load remembered audio/subtitle stream selections for a user+item
-/// (best-effort; failure means no recall).
-async fn load_saved_selections(
+/// Load remembered playback state for a user+item. Besides audio/subtitle
+/// choices, this contains the exact source that last produced real playback.
+async fn load_saved_playback_state(
     db: &sqlx::SqlitePool,
     user_id: &uuid::Uuid,
     media_id: &uuid::Uuid,
-) -> (Option<i64>, Option<i64>) {
+) -> Option<crate::db::UserMediaState> {
     let media = crate::db::Media::get_by_id(db, media_id)
         .await
         .ok()
         .flatten();
     let Some(media) = media else {
-        return (None, None);
+        return None;
     };
-    match sqlx::query_as::<_, crate::db::UserMediaState>(
+    sqlx::query_as::<_, crate::db::UserMediaState>(
         "SELECT * FROM user_media_state WHERE user_id = ?1 AND media_id = ?2",
     )
     .bind(user_id)
     .bind(media.id)
     .fetch_optional(db)
     .await
-    {
-        Ok(Some(state)) => (state.audio_idx, state.subtitle_idx),
-        _ => (None, None),
-    }
+    .ok()
+    .flatten()
+}
+
+fn remembered_resume_source<F>(
+    sources: &[crate::db::Media],
+    remembered_id: Option<Uuid>,
+    requested_resolution: Option<&str>,
+    mut has_downloaded_data: F,
+) -> Option<crate::db::Media>
+where
+    F: FnMut(&crate::db::Media) -> bool,
+{
+    let remembered_id = remembered_id?;
+    sources
+        .iter()
+        .find(|source| {
+            source.id == remembered_id
+                && source
+                    .stream_info
+                    .as_ref()
+                    .is_some_and(|info| info.is_p2p())
+                && requested_resolution.is_none_or(|requested| {
+                    source
+                        .stream_info
+                        .as_ref()
+                        .and_then(|info| info.resolution_tag())
+                        .is_some_and(|actual| actual.eq_ignore_ascii_case(requested))
+                })
+                && has_downloaded_data(source)
+        })
+        .cloned()
+}
+
+fn torrent_source_has_downloaded_data(
+    manager: &torrent::TorrentManager,
+    source: &crate::db::Media,
+) -> bool {
+    let Some(crate::stream::StreamDescriptor::Torrent {
+        info_hash,
+        file_hint,
+        file_idx,
+        ..
+    }) = source
+        .stream_info
+        .as_ref()
+        .map(|info| &info.descriptor)
+    else {
+        return false;
+    };
+    manager
+        .managed_file_progress(info_hash, *file_idx, file_hint.as_deref())
+        .is_some_and(|bytes| bytes > 0)
 }
 
 fn apply_item_runtime_fallback(
@@ -235,6 +284,55 @@ async fn items_playbackinfo_inner(
     .await
     .unwrap_or_default();
 
+    let saved_playback_state = load_saved_playback_state(
+        &state
+            .ctx
+            .db,
+        &session
+            .user
+            .id,
+        &id,
+    )
+    .await;
+    let remembered_resume_source_id = saved_playback_state
+        .as_ref()
+        .filter(|saved| saved.playback_position > 0)
+        .and_then(|saved| saved.stream_id);
+    let explicit_auto_resolution = media_source_id
+        .and_then(|source_id| StreamService::auto_resolution(id, source_id));
+    let remembered_explicit_auto_source = if explicit_auto_resolution.is_some() {
+        match remembered_resume_source_id {
+            Some(source_id) => db::Media::get_by_id(
+                &state
+                    .ctx
+                    .db,
+                &source_id,
+            )
+            .await
+            .ok()
+            .flatten()
+            .filter(|source| source.parent_id == Some(id))
+            .and_then(|source| {
+                remembered_resume_source(
+                    std::slice::from_ref(&source),
+                    Some(source_id),
+                    explicit_auto_resolution,
+                    |source| {
+                        torrent_source_has_downloaded_data(
+                            &state
+                                .ctx
+                                .torrent,
+                            source,
+                        )
+                    },
+                )
+            }),
+            None => None,
+        }
+    } else {
+        None
+    };
+
     let mut auto_requested: Option<uuid::Uuid> = None;
     let mut media = match MediaResolveService::resolve_item(
         media_source_id.unwrap_or(id),
@@ -251,20 +349,29 @@ async fn items_playbackinfo_inner(
                 if resolved.id != req {
                     if let Some(res) = StreamService::auto_resolution(id, req) {
                         auto_requested = Some(req);
-                        // Store mappings accelerate lookup but do not replace
-                        // current availability-based source selection.
-                        if let Ok(w) = crate::services::StreamService::resolve_auto(
-                            &state.ctx,
-                            id,
-                            res,
-                            Some(
-                                session
-                                    .user
-                                    .id,
-                            ),
-                        )
-                        .await
-                        {
+                        // A matching cached resume source avoids repeating a
+                        // cold start; otherwise select by current availability.
+                        let remembered = if explicit_auto_resolution == Some(res) {
+                            remembered_explicit_auto_source.clone()
+                        } else {
+                            None
+                        };
+                        let winner = match remembered {
+                            Some(source) => Some(source),
+                            None => crate::services::StreamService::resolve_auto(
+                                &state.ctx,
+                                id,
+                                res,
+                                Some(
+                                    session
+                                        .user
+                                        .id,
+                                ),
+                            )
+                            .await
+                            .ok(),
+                        };
+                        if let Some(w) = winner {
                             state
                                 .ctx
                                 .store
@@ -306,20 +413,24 @@ async fn items_playbackinfo_inner(
                     .store
                     .save(req.to_string(), id, std::time::Duration::MAX);
                 // Resolve the synthetic Auto source to a concrete live candidate.
-                match crate::services::StreamService::resolve_auto(
-                    &state.ctx,
-                    id,
-                    res,
-                    Some(
-                        session
-                            .user
-                            .id,
-                    ),
-                )
-                .await
-                {
-                    Ok(w) => w,
-                    Err(_) => db::Media {
+                let winner = match remembered_explicit_auto_source.clone() {
+                    Some(source) => Some(source),
+                    None => crate::services::StreamService::resolve_auto(
+                        &state.ctx,
+                        id,
+                        res,
+                        Some(
+                            session
+                                .user
+                                .id,
+                        ),
+                    )
+                    .await
+                    .ok(),
+                };
+                match winner {
+                    Some(w) => w,
+                    None => db::Media {
                         id: req,
                         title: format!("{} (auto)", res),
                         kind: db::MediaKind::Stream,
@@ -356,30 +467,33 @@ async fn items_playbackinfo_inner(
                 .trim_end_matches(" (auto)")
                 .trim()
                 .to_string();
-            if let Ok(w) = crate::services::StreamService::resolve_auto(
-                &state.ctx,
-                id,
-                &res,
-                Some(
-                    session
-                        .user
-                        .id,
-                ),
-            )
-            .await
-            {
-                w
-            } else {
-                m
-            }
+            let winner = match remembered_explicit_auto_source.clone() {
+                Some(source) => Some(source),
+                None => crate::services::StreamService::resolve_auto(
+                    &state.ctx,
+                    id,
+                    &res,
+                    Some(
+                        session
+                            .user
+                            .id,
+                    ),
+                )
+                .await
+                .ok(),
+            };
+            if let Some(w) = winner { w } else { m }
         } else {
             m
         }
     };
 
-    // When every available source is P2P, use the 1080p Auto tier as the
-    // latency-oriented default. A local, HTTP/debrid, RTSP, or OpenDAL source
-    // must retain its existing priority instead of being replaced implicitly.
+    // When every available source is P2P, use the latency-oriented Auto
+    // default. A resumed item prefers the exact torrent that previously
+    // produced playback so its downloaded pieces remain useful; normal Auto
+    // fallbacks stay available if it cannot resume. A local, HTTP/debrid, RTSP,
+    // or OpenDAL source must retain its existing priority.
+    let mut remembered_auto_source = None;
     let default_to_auto = if media_source_id.is_none()
         && matches!(media.kind, db::MediaKind::Movie | db::MediaKind::Episode)
     {
@@ -425,7 +539,7 @@ async fn items_playbackinfo_inner(
                 .await?;
         }
 
-        !root_is_direct
+        let all_p2p = !root_is_direct
             && !sources.is_empty()
             && sources
                 .iter()
@@ -434,15 +548,40 @@ async fn items_playbackinfo_inner(
                         .stream_info
                         .as_ref()
                         .is_some_and(|info| info.is_p2p())
-                })
+                });
+        if all_p2p {
+            remembered_auto_source = remembered_resume_source(
+                &sources,
+                remembered_resume_source_id,
+                None,
+                |source| {
+                    torrent_source_has_downloaded_data(
+                        &state
+                            .ctx
+                            .torrent,
+                        source,
+                    )
+                },
+            );
+        }
+        all_p2p
     } else {
         false
     };
     if default_to_auto {
-        if let Ok(w) = crate::services::StreamService::resolve_auto(
+        let resolution = remembered_auto_source
+            .as_ref()
+            .and_then(|source| {
+                source
+                    .stream_info
+                    .as_ref()
+                    .and_then(|info| info.resolution_tag())
+            })
+            .unwrap_or_else(|| "1080p".to_string());
+        let ranked = crate::services::StreamService::resolve_auto(
             &state.ctx,
             id,
-            "1080p",
+            &resolution,
             Some(
                 session
                     .user
@@ -450,11 +589,9 @@ async fn items_playbackinfo_inner(
             ),
         )
         .await
-        {
-            auto_requested = Some(uuid::Uuid::new_v5(
-                &uuid::Uuid::NAMESPACE_URL,
-                format!("{}-auto-1080p", id).as_bytes(),
-            ));
+        .ok();
+        if let Some(w) = remembered_auto_source.or(ranked) {
+            auto_requested = Some(StreamService::auto_source_id(id, &resolution));
             media = w;
         }
     }
@@ -582,16 +719,10 @@ async fn items_playbackinfo_inner(
     let server_subtitle_lang = probe_cfg
         .preferred_metadata_language
         .as_deref();
-    let (saved_audio, saved_subtitle) = load_saved_selections(
-        &state
-            .ctx
-            .db,
-        &session
-            .user
-            .id,
-        &id,
-    )
-    .await;
+    let (saved_audio, saved_subtitle) = saved_playback_state
+        .as_ref()
+        .map(|saved| (saved.audio_idx, saved.subtitle_idx))
+        .unwrap_or((None, None));
     clear_initial_auto_audio_placeholder(&mut q, auto_requested.is_some());
 
     for (
@@ -1976,6 +2107,227 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn torrent_failed_resume_preserves_state_without_changing_direct_progress() {
+        let (server, guard, token) = authenticated_server().await;
+        let auth = auth_header_with_token(&token);
+        let ctx = &guard.0;
+        let movie = seed_movie(ctx).await;
+        let mut source = insert_test_source(ctx).await;
+        source.parent_id = Some(movie.id);
+        source
+            .stream_info
+            .as_mut()
+            .expect("test source stream info")
+            .descriptor = crate::stream::StreamDescriptor::Torrent {
+            info_hash: "0123456789abcdef0123456789abcdef01234567".to_string(),
+            file_hint: Some("resume-test.mp4".to_string()),
+            file_idx: Some(0),
+            trackers: vec![],
+        };
+        source
+            .save(&ctx.db)
+            .await
+            .expect("save stream source");
+        let user = crate::db::User::get_by_username(&ctx.db, "test")
+            .await
+            .expect("load test user")
+            .expect("test user");
+        let mut state = crate::db::UserMediaState::get_or_new(&ctx.db, &user, &movie)
+            .await
+            .expect("load user media state");
+        state.playback_position = 1_218;
+        state.stream_id = Some(source.id);
+        state
+            .save(&ctx.db)
+            .await
+            .expect("save resume state");
+
+        let play_session_id = "failed-resume-state";
+        ctx.sessions
+            .begin_startup(
+                play_session_id,
+                movie.id,
+                user.id,
+                "test-device",
+                "test-client",
+            );
+        server
+            .post("/sessions/playing")
+            .add_header(
+                http::header::AUTHORIZATION,
+                HeaderValue::from_str(&auth).unwrap(),
+            )
+            .json(&json!({
+                "ItemId": movie.id,
+                "MediaSourceId": source.id,
+                "PlaySessionId": play_session_id,
+                "PositionTicks": 12_180_000_000i64,
+                "IsPaused": false
+            }))
+            .await
+            .assert_status(StatusCode::NO_CONTENT);
+        let transcode = crate::playback::session::TranscodeSession::new(
+            play_session_id.to_string(),
+            movie.id,
+            source.id,
+            "http://127.0.0.1/stream".to_string(),
+            std::env::temp_dir().join(uuid::Uuid::new_v4().to_string()),
+            "h264".to_string(),
+            "aac".to_string(),
+            None,
+            None,
+            false,
+            6,
+            crate::api::TranscodeReasons::default(),
+            movie
+                .runtime
+                .unwrap_or(0)
+                * 10_000_000,
+            false,
+            true,
+            Some("hevc".to_string()),
+            Some("aac".to_string()),
+            None,
+            None,
+            None,
+            Some(1920),
+            Some(1080),
+            None,
+            Some(8_000_000),
+            None,
+        );
+        ctx.sessions
+            .attach_transcode(play_session_id, transcode);
+
+        server
+            .post("/sessions/playing/progress")
+            .add_header(
+                http::header::AUTHORIZATION,
+                HeaderValue::from_str(&auth).unwrap(),
+            )
+            .json(&json!({
+                "ItemId": movie.id,
+                "MediaSourceId": source.id,
+                "PlaySessionId": play_session_id,
+                "PositionTicks": 0,
+                "IsPaused": false
+            }))
+            .await
+            .assert_status(StatusCode::NO_CONTENT);
+        server
+            .post("/sessions/playing/stopped")
+            .add_header(
+                http::header::AUTHORIZATION,
+                HeaderValue::from_str(&auth).unwrap(),
+            )
+            .json(&json!({
+                "ItemId": movie.id,
+                "MediaSourceId": source.id,
+                "PlaySessionId": play_session_id,
+                "PositionTicks": 0
+            }))
+            .await
+            .assert_status(StatusCode::NO_CONTENT);
+
+        let saved =
+            crate::db::UserMediaState::get_by_user_and_media(&ctx.db, &user, &movie)
+                .await
+                .expect("reload resume state")
+                .expect("saved resume state");
+        assert_eq!(saved.playback_position, 1_218);
+        assert_eq!(saved.stream_id, Some(source.id));
+
+        source
+            .stream_info
+            .as_mut()
+            .expect("test source stream info")
+            .descriptor = crate::stream::StreamDescriptor::http(
+            "https://example.invalid/resume-test.mp4",
+        );
+        source
+            .save(&ctx.db)
+            .await
+            .expect("save direct source");
+        let mut direct_state = saved;
+        direct_state.playback_position = 1_218;
+        direct_state
+            .save(&ctx.db)
+            .await
+            .expect("reset direct resume state");
+
+        let direct_session_id = "direct-resume-state";
+        server
+            .post("/sessions/playing")
+            .add_header(
+                http::header::AUTHORIZATION,
+                HeaderValue::from_str(&auth).unwrap(),
+            )
+            .json(&json!({
+                "ItemId": movie.id,
+                "MediaSourceId": source.id,
+                "PlaySessionId": direct_session_id,
+                "PositionTicks": 12_180_000_000i64,
+                "IsPaused": false
+            }))
+            .await
+            .assert_status(StatusCode::NO_CONTENT);
+        let direct_transcode = crate::playback::session::TranscodeSession::new(
+            direct_session_id.to_string(),
+            movie.id,
+            source.id,
+            "https://example.invalid/resume-test.mp4".to_string(),
+            std::env::temp_dir().join(uuid::Uuid::new_v4().to_string()),
+            "h264".to_string(),
+            "aac".to_string(),
+            None,
+            None,
+            false,
+            6,
+            crate::api::TranscodeReasons::default(),
+            movie
+                .runtime
+                .unwrap_or(0)
+                * 10_000_000,
+            false,
+            false,
+            Some("h264".to_string()),
+            Some("aac".to_string()),
+            None,
+            None,
+            None,
+            Some(1920),
+            Some(1080),
+            None,
+            Some(8_000_000),
+            None,
+        );
+        ctx.sessions
+            .attach_transcode(direct_session_id, direct_transcode);
+        server
+            .post("/sessions/playing/progress")
+            .add_header(
+                http::header::AUTHORIZATION,
+                HeaderValue::from_str(&auth).unwrap(),
+            )
+            .json(&json!({
+                "ItemId": movie.id,
+                "MediaSourceId": source.id,
+                "PlaySessionId": direct_session_id,
+                "PositionTicks": 0,
+                "IsPaused": false
+            }))
+            .await
+            .assert_status(StatusCode::NO_CONTENT);
+        let direct_saved =
+            crate::db::UserMediaState::get_by_user_and_media(&ctx.db, &user, &movie)
+                .await
+                .expect("reload direct resume state")
+                .expect("saved direct resume state");
+        assert_eq!(direct_saved.playback_position, 0);
+        assert_eq!(direct_saved.stream_id, Some(source.id));
+    }
+
+    #[tokio::test]
     async fn test_playback_stopped() {
         let (server, _ctx, token) = authenticated_server().await;
         let auth = auth_header_with_token(&token);
@@ -3309,6 +3661,95 @@ mod tests {
                     .to_string()
             ),
             "torrent-only playback should retain the Auto winner; got {torrent_only_path}"
+        );
+
+        let mut undownloaded_torrent = torrent.clone();
+        undownloaded_torrent.id = uuid::Uuid::new_v4();
+        undownloaded_torrent.title = "Torrentio 1080p previously watched".to_string();
+        undownloaded_torrent.idx = Some(2);
+        let resumed_info = undownloaded_torrent
+            .stream_info
+            .as_mut()
+            .expect("resumed torrent stream info");
+        resumed_info.descriptor = StreamDescriptor::Torrent {
+            info_hash: "fedcba9876543210fedcba9876543210fedcba98".to_string(),
+            file_hint: Some("remembered-candidate.mp4".to_string()),
+            file_idx: Some(0),
+            trackers: vec![],
+        };
+        resumed_info.filename = Some("remembered-candidate.1080p.mp4".to_string());
+        resumed_info.seeders = Some(1);
+        undownloaded_torrent
+            .save(&ctx.db)
+            .await
+            .expect("save remembered torrent source");
+
+        assert_eq!(
+            super::remembered_resume_source(
+                &[torrent.clone(), undownloaded_torrent.clone()],
+                Some(undownloaded_torrent.id),
+                Some("1080p"),
+                |source| source.id == undownloaded_torrent.id,
+            )
+            .map(|source| source.id),
+            Some(undownloaded_torrent.id),
+        );
+        assert!(
+            super::remembered_resume_source(
+                &[torrent.clone(), undownloaded_torrent.clone()],
+                Some(undownloaded_torrent.id),
+                Some("1080p"),
+                |_| false,
+            )
+            .is_none(),
+            "a remembered torrent without downloaded data must not bypass Auto ranking"
+        );
+        assert!(
+            super::remembered_resume_source(
+                &[torrent.clone(), undownloaded_torrent.clone()],
+                Some(undownloaded_torrent.id),
+                Some("4K"),
+                |_| true,
+            )
+            .is_none(),
+            "a cached 1080p torrent must not override an explicit 4K Auto request"
+        );
+
+        let user = crate::db::User::get_by_username(&ctx.db, "test")
+            .await
+            .expect("load test user")
+            .expect("test user");
+        let mut user_state =
+            crate::db::UserMediaState::get_or_new(&ctx.db, &user, &movie)
+                .await
+                .expect("load user media state");
+        user_state.playback_position = 600;
+        user_state.stream_id = Some(undownloaded_torrent.id);
+        user_state
+            .save(&ctx.db)
+            .await
+            .expect("save remembered torrent source");
+
+        let resume_response = server
+            .post(&format!("/items/{}/playbackinfo", movie.id))
+            .add_header(
+                http::header::AUTHORIZATION,
+                HeaderValue::from_str(&auth).unwrap(),
+            )
+            .json(&json!({ "StartTimeTicks": 6_000_000_000i64 }))
+            .await;
+        resume_response.assert_status_ok();
+        let resume_body: serde_json::Value = resume_response.json();
+        let resume_path = resume_body["MediaSources"][0]["Path"]
+            .as_str()
+            .expect("resume media source path");
+        assert!(
+            resume_path.contains(
+                &torrent
+                    .id
+                    .to_string()
+            ),
+            "a remembered torrent with no downloaded data should use normal Auto ranking; got {resume_path}",
         );
     }
 

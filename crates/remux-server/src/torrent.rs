@@ -706,6 +706,49 @@ impl TorrentManager {
         })
     }
 
+    /// Return downloaded bytes for the exact file represented by a torrent
+    /// source. This is intentionally read-only: resume selection can prefer
+    /// useful local data without starting the torrent or allocating anything.
+    pub(crate) fn managed_file_progress(
+        &self,
+        info_hash: &str,
+        file_idx: Option<usize>,
+        file_hint: Option<&str>,
+    ) -> Option<u64> {
+        let api = Api::new(
+            self.session
+                .clone(),
+            None,
+            None,
+        );
+        let torrent = api
+            .api_torrent_list_ext(ApiTorrentListOpts { with_stats: true })
+            .torrents
+            .into_iter()
+            .find(|torrent| {
+                torrent
+                    .info_hash
+                    .eq_ignore_ascii_case(info_hash)
+            })?;
+        let torrent_id = torrent.id?;
+        let files = api
+            .api_torrent_details(TorrentIdOrHash::Id(torrent_id))
+            .ok()?
+            .files?
+            .into_iter()
+            .map(|file| CachedTorrentFile {
+                name: file.name,
+                length: file.length,
+            })
+            .collect::<Vec<_>>();
+        let selected_idx = select_file_index(&files, file_idx, file_hint).ok()?;
+        torrent
+            .stats?
+            .file_progress
+            .get(selected_idx)
+            .copied()
+    }
+
     /// Put peers that answered a live wire-protocol probe at the front of the
     /// cached peer list used by the eventual download. Metadata preflight can
     /// discover many stale addresses; preserving the responsive subset avoids

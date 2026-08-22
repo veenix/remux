@@ -6,7 +6,7 @@ use std::{
     process::Stdio,
     sync::{
         Arc,
-        atomic::{AtomicU32, Ordering},
+        atomic::{AtomicBool, AtomicU32, Ordering},
     },
 };
 use tokio::sync::RwLock;
@@ -159,6 +159,23 @@ fn adaptive_buffer_secs(production_ratio: f64, segment_length: u32) -> u32 {
     raw.div_ceil(segment_length.max(1)) * segment_length.max(1)
 }
 
+fn should_pause_buffer_production(
+    client_paused: bool,
+    ahead: u32,
+    target_buffer_secs: u32,
+) -> bool {
+    !client_paused && ahead >= target_buffer_secs
+}
+
+fn should_resume_buffer_production(
+    client_paused: bool,
+    ahead: u32,
+    target_buffer_secs: u32,
+    segment_length: u32,
+) -> bool {
+    client_paused || ahead < target_buffer_secs.saturating_sub(segment_length * 2)
+}
+
 fn ffmpeg_bin() -> String {
     std::env::var("FFMPEG_PATH").unwrap_or_else(|_| "ffmpeg".into())
 }
@@ -171,12 +188,15 @@ fn send_signal(pid: u32, sig: libc::c_int) {
 #[cfg(not(unix))]
 fn send_signal(_pid: u32, _sig: i32) {}
 
-/// Spawn the buffer-throttle task. It pauses/resumes ffmpeg so it never
-/// encodes more than MAX_BUFFER_SECS ahead of what the client has requested.
+/// Spawn the buffer-throttle task. While playback is advancing it bounds
+/// ffmpeg's lead; an explicitly paused session keeps producing so the selected
+/// torrent accumulates useful data for a quick resume.
 fn spawn_buffer_monitor(
     output_dir: PathBuf,
     segment_length: u32,
     playback_offset_secs: Arc<AtomicU32>,
+    playback_paused: Arc<AtomicBool>,
+    source_is_p2p: bool,
     ffmpeg_pid: Arc<AtomicU32>,
     mut stop_rx: tokio::sync::oneshot::Receiver<()>,
     play_session_id: String,
@@ -203,6 +223,8 @@ fn spawn_buffer_monitor(
             let playback_secs = playback_offset_secs.load(Ordering::Relaxed);
 
             let ahead = buffered_secs.saturating_sub(playback_secs);
+            let client_paused =
+                source_is_p2p && playback_paused.load(Ordering::Relaxed);
 
             if ticks % 5 == 0 {
                 let elapsed = last_sample_at
@@ -234,7 +256,14 @@ fn spawn_buffer_monitor(
                 last_sample_segments = produced;
             }
 
-            if pid != 0 && !paused && ahead >= target_buffer_secs {
+            if pid != 0
+                && !paused
+                && should_pause_buffer_production(
+                    client_paused,
+                    ahead,
+                    target_buffer_secs,
+                )
+            {
                 debug!(
                     play_session_id,
                     pid, ahead, target_buffer_secs, "Buffer full — pausing ffmpeg"
@@ -244,11 +273,16 @@ fn spawn_buffer_monitor(
                 paused = true;
             } else if pid != 0
                 && paused
-                && ahead < target_buffer_secs.saturating_sub(segment_length * 2)
+                && should_resume_buffer_production(
+                    client_paused,
+                    ahead,
+                    target_buffer_secs,
+                    segment_length,
+                )
             {
                 debug!(
                     play_session_id,
-                    pid, ahead, "Buffer drained — resuming ffmpeg"
+                    pid, ahead, client_paused, "Resuming ffmpeg buffer production"
                 );
                 #[cfg(unix)]
                 send_signal(pid, libc::SIGCONT);
@@ -1119,6 +1153,9 @@ pub async fn start_transcode(
                     s.segment_length,
                     s.playback_offset_secs
                         .clone(),
+                    s.playback_paused
+                        .clone(),
+                    s.source_is_p2p,
                     ffmpeg_pid.clone(),
                     monitor_stop_rx,
                     s.id.clone(),
@@ -2018,6 +2055,13 @@ mod tests {
         assert_eq!(adaptive_buffer_secs(10.0, 6), MIN_BUFFER_SECS);
     }
 
+    #[test]
+    fn paused_playback_keeps_buffer_production_running() {
+        assert!(should_pause_buffer_production(false, 300, 300));
+        assert!(!should_pause_buffer_production(true, 300, 300));
+        assert!(should_resume_buffer_production(true, 300, 300, 6));
+    }
+
     fn args_contains(args: &[String], flag: &str) -> bool {
         args.iter()
             .any(|a| a == flag)
@@ -2434,6 +2478,8 @@ mod tests {
             last_segment_index: Arc::new(AtomicU32::new(0)),
             start_time_secs: 30,
             playback_offset_secs: Arc::new(AtomicU32::new(0)),
+            playback_paused: Arc::new(AtomicBool::new(false)),
+            source_is_p2p: false,
             runtime_ticks: 120i64
                 .to_ticks(TickUnit::Seconds)
                 .unwrap(),

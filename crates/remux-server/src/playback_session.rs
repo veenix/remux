@@ -21,6 +21,9 @@ pub struct PlaybackSession {
     pub device_id: String,
     pub client_name: String,
     pub position_ticks: i64,
+    /// True after an unpaused progress report advances playback. Until then,
+    /// a failed resume must not overwrite the prior position or source.
+    pub playback_confirmed: bool,
     pub can_seek: bool,
     pub is_paused: bool,
     pub last_paused_at: Option<DateTime<Utc>>,
@@ -62,6 +65,21 @@ struct PlaybackStartupFailure {
     item_id: Uuid,
     user_id: Uuid,
     failed_at: Instant,
+}
+
+fn playback_progress_confirmed(
+    was_confirmed: bool,
+    startup_was_pending: bool,
+    confirmed_now: bool,
+    is_paused: bool,
+    previous_ticks: i64,
+    reported_ticks: Option<i64>,
+) -> bool {
+    let position_advanced =
+        reported_ticks.is_some_and(|position| position > previous_ticks);
+    was_confirmed
+        || confirmed_now
+        || (!startup_was_pending && !is_paused && position_advanced)
 }
 
 #[derive(Clone, Debug)]
@@ -584,6 +602,7 @@ impl PlaybackSessionManager {
             position_ticks: data
                 .position_ticks
                 .unwrap_or(0),
+            playback_confirmed: false,
             can_seek: data.can_seek,
             is_paused: data.is_paused,
             last_paused_at: if data.is_paused {
@@ -726,14 +745,27 @@ impl PlaybackSessionManager {
         } else {
             ps.item_id
         };
+        let source_is_p2p = if let Some(transcode) = ps
+            .transcode
+            .as_ref()
+        {
+            transcode
+                .read()
+                .await
+                .source_is_p2p
+        } else {
+            false
+        };
 
-        if let Some(report) = self.confirm_startup(
+        let startup_was_pending = self.has_startup(psid);
+        let startup_report = self.confirm_startup(
             psid,
             ps.position_ticks,
             data.position_ticks,
             data.is_paused,
-        ) {
-            if let Err(error) = db::record_playback_startup(db, &report).await {
+        );
+        if let Some(report) = startup_report.as_ref() {
+            if let Err(error) = db::record_playback_startup(db, report).await {
                 warn!(%error, play_session_id = psid, "failed to persist playback startup metric");
             }
             info!(
@@ -753,6 +785,18 @@ impl PlaybackSessionManager {
                 "▶ Actual playback confirmed"
             );
         }
+        let startup_confirmed = playback_progress_confirmed(
+            ps.playback_confirmed,
+            startup_was_pending,
+            startup_report.is_some(),
+            data.is_paused,
+            ps.position_ticks,
+            data.position_ticks,
+        );
+        let accept_reported_position = !source_is_p2p || startup_confirmed;
+        // A failed torrent resume can make a client briefly report a zero-based
+        // timeline. Keep its last known position until playback advances.
+        // Direct sources retain their existing progress semantics.
 
         // Detect encode-parameter changes and log them once.
         // We ignore pause/unpause — those are not encode changes.
@@ -803,9 +847,12 @@ impl PlaybackSessionManager {
             {
                 ps.item_id = data.item_id;
             }
-            ps.position_ticks = data
-                .position_ticks
-                .unwrap_or(ps.position_ticks);
+            if accept_reported_position {
+                ps.position_ticks = data
+                    .position_ticks
+                    .unwrap_or(ps.position_ticks);
+            }
+            ps.playback_confirmed = startup_confirmed;
             if data.is_paused && !ps.is_paused {
                 ps.last_paused_at = Some(Utc::now());
             } else if !data.is_paused {
@@ -829,21 +876,28 @@ impl PlaybackSessionManager {
         });
 
         // Update transcode buffer monitor with actual playback position.
-        if let Some(position_ticks) = data.position_ticks {
-            if let Some(ref ts_lock) = ps.transcode {
-                if let Ok(ts) = ts_lock.try_read() {
-                    let position_secs = (position_ticks / 10_000_000) as u32;
-                    let offset = position_secs.saturating_sub(ts.start_time_secs);
-                    ts.playback_offset_secs
-                        .store(offset, std::sync::atomic::Ordering::Relaxed);
+        if let Some(ref ts_lock) = ps.transcode {
+            if let Ok(ts) = ts_lock.try_read() {
+                ts.playback_paused
+                    .store(data.is_paused, std::sync::atomic::Ordering::Relaxed);
+                if accept_reported_position {
+                    if let Some(position_ticks) = data.position_ticks {
+                        let position_secs = (position_ticks / 10_000_000) as u32;
+                        let offset = position_secs.saturating_sub(ts.start_time_secs);
+                        ts.playback_offset_secs
+                            .store(offset, std::sync::atomic::Ordering::Relaxed);
+                    }
                 }
             }
         }
 
         // Persist position to DB (no watched-threshold check on progress).
-        let position_ticks = data
-            .position_ticks
-            .unwrap_or(ps.position_ticks);
+        let position_ticks = if accept_reported_position {
+            data.position_ticks
+                .unwrap_or(ps.position_ticks)
+        } else {
+            ps.position_ticks
+        };
         let selected_stream_id = if let Some(transcode) = ps
             .transcode
             .as_ref()
@@ -889,17 +943,19 @@ impl PlaybackSessionManager {
                 None
             };
 
-            db::UserMediaState::update_playback(
-                db,
-                user,
-                &media,
-                position_ticks,
-                selected_stream_id,
-                audio_idx,
-                subtitle_idx,
-                media.runtime,
-            )
-            .await?;
+            if accept_reported_position {
+                db::UserMediaState::update_playback(
+                    db,
+                    user,
+                    &media,
+                    position_ticks,
+                    selected_stream_id,
+                    audio_idx,
+                    subtitle_idx,
+                    media.runtime,
+                )
+                .await?;
+            }
         }
 
         Ok(())
@@ -929,13 +985,37 @@ impl PlaybackSessionManager {
                 ps.as_ref()
                     .map(|s| s.item_id)
             });
-        let final_ticks = data
-            .position_ticks
-            .or_else(|| {
-                ps.as_ref()
-                    .map(|s| s.position_ticks)
-            });
-        let selected_stream_id = if let Some(session) = ps.as_ref() {
+        let previous_ticks = ps
+            .as_ref()
+            .map(|session| session.position_ticks)
+            .unwrap_or(0);
+        let source_is_p2p = if let Some(transcode) = ps
+            .as_ref()
+            .and_then(|session| {
+                session
+                    .transcode
+                    .as_ref()
+            }) {
+            transcode
+                .read()
+                .await
+                .source_is_p2p
+        } else {
+            false
+        };
+        let reported_ticks = data.position_ticks;
+        let final_ticks = reported_ticks.or(Some(previous_ticks));
+        let playback_confirmed = !source_is_p2p
+            || ps
+                .as_ref()
+                .is_some_and(|session| {
+                    session.playback_confirmed
+                        || reported_ticks
+                            .is_some_and(|position| position > session.position_ticks)
+                });
+        let selected_stream_id = if !playback_confirmed {
+            None
+        } else if let Some(session) = ps.as_ref() {
             if let Some(transcode) = session
                 .transcode
                 .as_ref()
@@ -967,19 +1047,21 @@ impl PlaybackSessionManager {
         };
 
         let mut played = false;
-        if let Some(item_id) = item_id {
-            if let Ok(Some(media)) = db::Media::get_by_id(db, &item_id).await {
-                played = db::UserMediaState::update_playback(
-                    db,
-                    user,
-                    &media,
-                    final_ticks.unwrap_or(0),
-                    selected_stream_id,
-                    None, // don't overwrite stream selections on stop
-                    None,
-                    media.runtime, // Some(runtime) triggers watched-threshold check
-                )
-                .await?;
+        if playback_confirmed {
+            if let Some(item_id) = item_id {
+                if let Ok(Some(media)) = db::Media::get_by_id(db, &item_id).await {
+                    played = db::UserMediaState::update_playback(
+                        db,
+                        user,
+                        &media,
+                        final_ticks.unwrap_or(0),
+                        selected_stream_id,
+                        None, // don't overwrite stream selections on stop
+                        None,
+                        media.runtime, // Some(runtime) triggers watched-threshold check
+                    )
+                    .await?;
+                }
             }
         }
 
@@ -1005,6 +1087,19 @@ impl PlaybackSessionManager {
                     .transcode
                     .clone();
             }
+        }
+        if let Some(transcode) = session
+            .transcode
+            .as_ref()
+            .and_then(|transcode| {
+                transcode
+                    .try_read()
+                    .ok()
+            })
+        {
+            transcode
+                .playback_paused
+                .store(session.is_paused, std::sync::atomic::Ordering::Relaxed);
         }
         // Remove any previous session for this device (different play_session_id).
         if !session
@@ -1284,6 +1379,7 @@ impl PlaybackSessionManager {
                         device_id: inherited_device_id,
                         client_name: String::new(),
                         position_ticks: 0,
+                        playback_confirmed: false,
                         can_seek: true,
                         is_paused: false,
                         last_paused_at: None,
@@ -1635,6 +1731,34 @@ mod startup_metric_tests {
                 .confirm_startup("paused-test", 0, Some(0), false)
                 .is_none()
         );
+    }
+
+    #[test]
+    fn failed_resume_progress_does_not_replace_the_saved_position() {
+        assert!(!playback_progress_confirmed(
+            false,
+            true,
+            false,
+            false,
+            1_218 * 10_000_000,
+            Some(0)
+        ));
+        assert!(playback_progress_confirmed(
+            true,
+            false,
+            false,
+            false,
+            1_218 * 10_000_000,
+            Some(0)
+        ));
+        assert!(playback_progress_confirmed(
+            false,
+            false,
+            false,
+            false,
+            0,
+            Some(10_000_000)
+        ));
     }
 
     #[test]
